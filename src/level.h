@@ -94,6 +94,7 @@ private:
 	MaterialProperty<QuadblockTrigger, MaterialType::TURBO_PAD> m_propTurboPads;
 	std::vector<Path> m_checkpointPaths;
 	std::vector<AnimTexture> m_animTextures;
+	std::unordered_map<uint16_t, std::tuple<Vec3, Vec3>> m_levInstPosRot;
 
 	Mesh m_lowLODMesh;
 	Mesh m_highLODMesh;
@@ -106,6 +107,7 @@ private:
 	Model m_checkModel;
 	Model m_selectedBlockModel;
 	Model m_multipleSelectedQuads;
+	std::vector<Model> m_levelInstancesModels;
 
 	size_t m_rendererSelectedQuadblockIndex;
 	BitMatrix m_bspViz;
