@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <unordered_set>
+#include <unordered_map>
 #include <tuple>
 
 const std::unordered_map<std::string, uint16_t> SimpleLevelInstances::mesh_prefixes_to_enum = {
@@ -20,6 +21,8 @@ const std::unordered_map<std::string, uint16_t> SimpleLevelInstances::mesh_prefi
 		{"time_crate_3", TIME_CRATE_3},
 		{"startflag", START_FLAG},
 };
+
+std::unordered_map<uint16_t, Mesh> SimpleLevelInstances::mesh_instances;
 
 void SimpleLevelInstances::GenerateRenderLevInstData()
 {
