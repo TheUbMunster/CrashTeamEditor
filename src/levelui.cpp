@@ -479,7 +479,7 @@ void Level::RenderUI()
 
 	if (m_showModelExtractorWindow)
 	{
-		if (ImGui::Begin("Model Extractor", &m_showModelExtractorWindow))
+		if (ImGui::Begin("Level Asset Extractor", &m_showModelExtractorWindow))
 		{
 			std::string levPath = m_modelExtractorLevPath.string();
 			ImGui::Text("Lev Path"); ImGui::SameLine();
@@ -510,15 +510,23 @@ void Level::RenderUI()
         m_extractorLog = extractor.GetLog();
         m_showExtractorLogWindow = true;
 			}
+			ImGui::SameLine();
+			if (ImGui::Button("Extract Icons"))
+			{
+        LevDataExtractor extractor{ m_modelExtractorLevPath, m_modelExtractorVrmPath };
+        extractor.ExtractIcons();
+        m_extractorLog = extractor.GetLog();
+        m_showExtractorLogWindow = true;
+			}
 			ImGui::EndDisabled();
-			if (disabled) { ImGui::SetItemTooltip("You must select both lev and vrm files before extracting models."); }
+			if (disabled) { ImGui::SetItemTooltip("You must select both lev and vrm files before extracting."); }
 		}
 		ImGui::End();
 	}
 
 	if (m_showModelImporterWindow)
 	{
-		if (ImGui::Begin("Model Importer", &m_showModelImporterWindow))
+		if (ImGui::Begin("Instance Manager", &m_showModelImporterWindow))
 		{
 			std::string modelPath = m_modelImporterPath.string();
 			ImGui::Text("Model Path"); ImGui::SameLine();
@@ -705,6 +713,92 @@ void Level::RenderUI()
 		ImGui::End();
 	}
 
+	if (m_showIconImporterWindow)
+	{
+		if (ImGui::Begin("Icon Manager", &m_showIconImporterWindow))
+		{
+			std::string iconPath = m_iconImporterPath.string();
+			ImGui::Text("Icon Path"); ImGui::SameLine();
+			ImGui::InputText("##iconpath_importer", &iconPath, ImGuiInputTextFlags_ReadOnly);
+			ImGui::SetItemTooltip(iconPath.c_str()); ImGui::SameLine();
+			if (ImGui::Button("...##iconimporter"))
+			{
+				auto selection = pfd::open_file("CTR Icon Group File", m_parentPath.string(), {"CTR Icon Group Files", "*.ctricongroup"}, pfd::opt::force_path).result();
+				if (!selection.empty()) { m_iconImporterPath = selection.front(); }
+			}
+
+			bool disabled = iconPath.empty();
+			ImGui::BeginDisabled(disabled);
+			if (ImGui::Button("Import Icon Group"))
+			{
+				if (ImportIconGroup(m_iconImporterPath))
+				{
+					m_logMessage = "Successfully imported icon group: " + m_iconImporterPath.filename().string();
+					m_showLogWindow = true;
+				}
+				else
+				{
+					m_logMessage = "Failed to import icon group: " + m_iconImporterPath.filename().string();
+					m_showLogWindow = true;
+				}
+			}
+			ImGui::EndDisabled();
+			if (disabled) { ImGui::SetItemTooltip("You must select a .ctricongroup file before importing."); }
+
+			// Show list of currently loaded icon groups
+			ImGui::Separator();
+			ImGui::Text("Loaded Icon Groups (%zu)", m_importedIconGroups.size());
+			ImGui::Separator();
+
+			if (!m_importedIconGroups.empty())
+			{
+				std::string iconGroupToDelete;
+				for (auto& [groupName, iconGroup] : m_importedIconGroups)
+				{
+					ImGui::PushID(groupName.c_str());
+
+					// Parse group data to show icon count
+					const SH::CtrIconGroup* header = reinterpret_cast<const SH::CtrIconGroup*>(iconGroup.rawData.data());
+					const SH::IconGroupData* groupData = reinterpret_cast<const SH::IconGroupData*>(
+						iconGroup.rawData.data() + header->iconGroupOffset);
+
+					ImGui::Text("%s", groupName.c_str());
+					ImGui::SameLine();
+					ImGui::Text("(%u icons)", groupData->numIcons);
+					ImGui::SameLine();
+
+					// Checkbox to toggle import as global
+					bool importAsGlobal = iconGroup.importAsGlobal;
+					if (ImGui::Checkbox("Global##checkbox", &importAsGlobal))
+					{
+						iconGroup.importAsGlobal = importAsGlobal;
+					}
+					ImGui::SetItemTooltip("If checked, icons will be added to the global icon list. Otherwise, they will be added as a named group.");
+
+					ImGui::SameLine(ImGui::GetContentRegionAvail().x - 20);
+					if (ImGui::Button("X"))
+					{
+						iconGroupToDelete = groupName;
+					}
+					ImGui::PopID();
+				}
+
+				// Delete the icon group after iteration to avoid iterator invalidation
+				if (!iconGroupToDelete.empty())
+				{
+					m_importedIconGroups.erase(iconGroupToDelete);
+					m_logMessage = "Removed icon group: " + iconGroupToDelete;
+					m_showLogWindow = true;
+				}
+			}
+			else
+			{
+				ImGui::TextDisabled("No icon groups loaded");
+			}
+		}
+		ImGui::End();
+	}
+
 	if (!m_loaded) { return; }
 
 	if (ImGui::BeginMainMenuBar())
@@ -718,7 +812,8 @@ void Level::RenderUI()
 		if (ImGui::MenuItem("BSP Tree")) { Windows::w_bsp = !Windows::w_bsp; }
 		if (ImGui::MenuItem("Renderer")) { Windows::w_renderer = !Windows::w_renderer; }
 		if (ImGui::MenuItem("Ghosts")) { Windows::w_ghost = !Windows::w_ghost; }
-		if (ImGui::MenuItem("Model Importer")) { m_showModelImporterWindow = !m_showModelImporterWindow; }
+		if (ImGui::MenuItem("Instance Manager")) { m_showModelImporterWindow = !m_showModelImporterWindow; }
+		if (ImGui::MenuItem("Icon Manager")) { m_showIconImporterWindow = !m_showIconImporterWindow; }
 		ImGui::EndMainMenuBar();
 	}
 

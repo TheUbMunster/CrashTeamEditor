@@ -483,6 +483,43 @@ namespace PSX
 		uint32_t offLastPoint;
 		uint16_t physUnk[0x20];
 	};
+
+	struct Icon
+	{
+		// https://github.com/DCxDemo/CTR-tools/blob/master/ctr-tools/CTRFramework/CTRFramework.Code/lev/TextureLayout.cs
+		char name[0x10];
+		uint32_t global_IconArray_Index;
+
+		struct TextureLayout texLayout;
+	};
+
+	struct IconGroup
+	{
+		char name[16];
+		uint16_t groupID;
+		uint16_t numIcons;
+	};
+
+	struct LevIconsLookup
+	{
+		uint32_t numIcon;
+		uint32_t offFirstIcon; //struct Icon*
+		uint32_t numIconGroup;
+		uint32_t offFirstIconGroupPtr; //struct IconGroup**
+	};
+
+	struct Map
+	{
+		int16_t worldEndX;
+		int16_t worldEndY;
+		int16_t worldStartX;
+		int16_t worldStartY;
+		int16_t iconSizeX;
+		int16_t iconSizeY;
+		int16_t iconStartX;
+		int16_t iconStartY;
+		int16_t mode;
+	};
 }
 
 template<>

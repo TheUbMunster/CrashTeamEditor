@@ -23,6 +23,14 @@
 
 static constexpr size_t REND_NO_SELECTED_QUADBLOCK = std::numeric_limits<size_t>::max();
 
+// Imported icon group data (from .ctricongroup)
+struct ImportedIconGroup
+{
+	std::string name;                  // Group name
+	bool importAsGlobal;               // User choice: import as global or named group
+	std::vector<uint8_t> rawData;      // Raw .ctricongroup file data
+};
+
 class Level
 {
 public:
@@ -32,8 +40,10 @@ public:
 	void OpenHotReloadWindow();
 	void OpenModelExtractorWindow();
 	void OpenModelImporterWindow();
+	void OpenIconImporterWindow();
 	void Clear(bool clearErrors);
 	bool ImportModel(const std::filesystem::path& ctrmodelPath);
+	bool ImportIconGroup(const std::filesystem::path& ctricongroupPath);
 	const std::string& GetName() const;
 	const std::vector<Quadblock>& GetQuadblocks() const;
 	const std::filesystem::path& GetParentPath() const;
@@ -72,6 +82,7 @@ private:
 	bool m_showHotReloadWindow;
 	bool m_showModelExtractorWindow;
 	bool m_showModelImporterWindow;
+	bool m_showIconImporterWindow;
 	bool m_showExtractorLogWindow;
 	bool m_loaded;
 	bool m_genVisTree;
@@ -88,6 +99,7 @@ private:
 	std::filesystem::path m_modelExtractorLevPath;
 	std::filesystem::path m_modelExtractorVrmPath;
 	std::filesystem::path m_modelImporterPath;
+	std::filesystem::path m_iconImporterPath;
 
 	std::array<Spawn, NUM_DRIVERS> m_spawn;
 	uint32_t m_configFlags;
@@ -137,4 +149,10 @@ private:
 	// Hardcoded instances for now (TODO: make dynamic)
 	std::vector<PSX::InstDef> m_modelInstances;
 	std::vector<std::string> m_modelInstanceNames;  // Parallel array: which model each instance uses
+
+	// Imported .ctricongroup data (name -> ImportedIconGroup)
+	std::unordered_map<std::string, ImportedIconGroup> m_importedIconGroups;
+
+	// Icon textures placed in VRAM (filled by UpdateVRM, used by SaveLEV)
+	std::vector<IconTextureForVRM> m_iconTexturesInVRAM;
 };

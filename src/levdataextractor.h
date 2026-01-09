@@ -13,6 +13,7 @@ public:
 	LevDataExtractor(const std::filesystem::path& levPath, const std::filesystem::path& vrmPath);
 
 	void ExtractModels(void);
+	void ExtractIcons(void);
 	const std::string& GetLog() const { return m_log; }
 
 	// Texture extraction helpers (public for use by free functions)
@@ -118,5 +119,23 @@ namespace SH
 		int bpp = 0;
 		int blendMode = 0;
 		PSX::TextureLayout representativeLayout;
+	};
+
+	// Icon group file format (.ctricongroup)
+	struct CtrIconGroup
+	{
+		uint32_t iconGroupOffset;      // Offset to IconGroupData
+		uint32_t iconPatchTableOffset; // Offset to patch table
+		uint32_t textureDataOffset;    // Offset to TextureSectionHeader (0 if no textures)
+	};
+
+	struct IconGroupData
+	{
+		char groupName[16];      // Group name (empty string for global/standalone icon)
+		uint16_t groupID;        // Original group ID
+		uint16_t numIcons;       // Number of icons in this group
+		uint8_t isGlobal;        // 1 if this was a global/standalone icon, 0 for named group
+		uint8_t padding[3];      // Alignment padding
+		// Followed by: PSX::Icon structs (numIcons entries, 36 bytes each)
 	};
 }

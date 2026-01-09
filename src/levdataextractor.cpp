@@ -1129,3 +1129,339 @@ void LevDataExtractor::ExtractModels(void)
 
 	#undef nameof
 }
+
+void LevDataExtractor::ExtractIcons(void)
+{
+	#define nameof(x) #x
+
+	Log("Extracting icons from LEV: %s\n", m_levPath.string().c_str());
+
+	// Create output directory for extracted icons
+	std::filesystem::path outputDir = m_levPath.parent_path() / "extracted_icons";
+	std::filesystem::create_directories(outputDir);
+	Log("Output directory: %s\n", outputDir.string().c_str());
+
+	auto Deref = [this](uint32_t offset) -> const uint8_t* {
+		return m_levData.data() + offset + 4; // offsets are from start of file + 4
+	};
+
+	const PSX::LevHeader& levHeader = *reinterpret_cast<const PSX::LevHeader*>(m_levData.data() + 4);
+
+	// Parse VRM file into VRAM buffer for texture extraction
+	VramBuffer vram;
+	Log("\nParsing VRM file for textures...\n");
+	ParseVrmIntoVram(vram);
+
+	// Check if icons exist
+	if (levHeader.offIconsLookup == 0)
+	{
+		Log("%sWARNING%s: No icons lookup in this level (offIconsLookup = 0)\n", ANSI_YELLOW, ANSI_RESET);
+		return;
+	}
+
+	const PSX::LevIconsLookup& iconsLookup = *reinterpret_cast<const PSX::LevIconsLookup*>(Deref(levHeader.offIconsLookup));
+	Log("\nIcons Lookup:\n");
+	Log("  numIcon (global): %u\n", iconsLookup.numIcon);
+	Log("  offFirstIcon: 0x%08X\n", iconsLookup.offFirstIcon);
+	Log("  numIconGroup: %u\n", iconsLookup.numIconGroup);
+	Log("  offFirstIconGroupPtr: 0x%08X\n", iconsLookup.offFirstIconGroupPtr);
+
+	// Helper lambda to write a single icon group file
+	auto WriteIconGroupFile = [&](const std::string& fileName, const char* groupName, uint16_t groupID,
+	                               bool isGlobal, const std::vector<const PSX::Icon*>& icons) -> bool
+	{
+		if (icons.empty())
+		{
+			Log("    %sWARNING%s: No icons to write for %s\n", ANSI_YELLOW, ANSI_RESET, fileName.c_str());
+			return false;
+		}
+
+		std::filesystem::path outputFilePath = outputDir / fileName;
+		std::ofstream outputFile(outputFilePath, std::ios::binary);
+		if (!outputFile)
+		{
+			Log("    %sERROR%s: Failed to create output file: %s\n", ANSI_RED, ANSI_RESET, outputFilePath.string().c_str());
+			return false;
+		}
+
+		std::vector<SH::WriteableObject> dataChunks{};
+		size_t currentOffset = 0;
+
+		// CtrIconGroup header
+		SH::CtrIconGroup* output_Header = reinterpret_cast<SH::CtrIconGroup*>(malloc(sizeof(SH::CtrIconGroup)));
+		currentOffset += sizeof(SH::CtrIconGroup);
+		dataChunks.push_back({ sizeof(SH::CtrIconGroup), output_Header });
+
+		// IconGroupData
+		const size_t iconGroupDataOffset = currentOffset;
+		SH::IconGroupData* output_GroupData = reinterpret_cast<SH::IconGroupData*>(malloc(sizeof(SH::IconGroupData)));
+		memset(output_GroupData, 0, sizeof(SH::IconGroupData));
+		strncpy(output_GroupData->groupName, groupName, 15);
+		output_GroupData->groupName[15] = '\0';
+		output_GroupData->groupID = groupID;
+		output_GroupData->numIcons = static_cast<uint16_t>(icons.size());
+		output_GroupData->isGlobal = isGlobal ? 1 : 0;
+		currentOffset += sizeof(SH::IconGroupData);
+		dataChunks.push_back({ sizeof(SH::IconGroupData), output_GroupData });
+
+		// Icon array
+		const size_t iconArrayOffset = currentOffset;
+		const size_t iconArraySize = icons.size() * sizeof(PSX::Icon);
+		PSX::Icon* output_Icons = reinterpret_cast<PSX::Icon*>(malloc(iconArraySize));
+		for (size_t i = 0; i < icons.size(); i++)
+		{
+			memcpy(&output_Icons[i], icons[i], sizeof(PSX::Icon));
+		}
+		currentOffset += iconArraySize;
+		dataChunks.push_back({ iconArraySize, output_Icons });
+
+		// Patch table (icons have no internal pointers that need patching)
+		const size_t patchTableOffset = currentOffset;
+		uint32_t patchCount = 0;
+		uint32_t* output_PatchCount = reinterpret_cast<uint32_t*>(malloc(sizeof(uint32_t)));
+		*output_PatchCount = patchCount;
+		currentOffset += sizeof(uint32_t);
+		dataChunks.push_back({ sizeof(uint32_t), output_PatchCount });
+
+		// Extract textures for icons
+		std::vector<RawTextureData> iconTextures;
+		std::unordered_map<std::string, size_t> keyToTextureIndex;
+
+		// Create texture output directory for debugging PNGs
+		std::filesystem::path texOutputDir = outputDir / (fileName.substr(0, fileName.size() - 13) + "_textures");
+		std::filesystem::create_directories(texOutputDir);
+
+		for (size_t i = 0; i < icons.size(); i++)
+		{
+			const PSX::Icon* icon = icons[i];
+			const PSX::TextureLayout& layout = icon->texLayout;
+
+			int pageX = layout.texPage.x;
+			int pageY = layout.texPage.y;
+			int palX = layout.clut.x;
+			int palY = layout.clut.y;
+			int bpp = layout.texPage.texpageColors;
+			int blendMode = layout.texPage.blendMode;
+
+			// Calculate UV bounds
+			int minU = std::min({layout.u0, layout.u1, layout.u2, layout.u3});
+			int minV = std::min({layout.v0, layout.v1, layout.v2, layout.v3});
+			int maxU = std::max({layout.u0, layout.u1, layout.u2, layout.u3});
+			int maxV = std::max({layout.v0, layout.v1, layout.v2, layout.v3});
+			int width = maxU - minU;
+			int height = maxV - minV;
+
+			std::string key = std::to_string(pageX) + "_" + std::to_string(pageY) + "_" +
+			                  std::to_string(palX) + "_" + std::to_string(palY) + "_" +
+			                  std::to_string(minU) + "_" + std::to_string(minV) + "_" +
+			                  std::to_string(width) + "_" + std::to_string(height);
+
+			if (keyToTextureIndex.find(key) == keyToTextureIndex.end() && width > 0 && height > 0)
+			{
+				// Extract raw PSX texture data
+				RawTextureData rawTex;
+				ExtractRawPSXTexture(vram, pageX, pageY, palX, palY, bpp, blendMode, minU, minV, width, height, rawTex);
+				rawTex.key = key;
+
+				size_t textureIndex = iconTextures.size();
+				iconTextures.push_back(std::move(rawTex));
+				keyToTextureIndex[key] = textureIndex;
+
+				// Save as PNG for debugging
+				std::vector<RGBA8> pixels;
+				PSX::TextureLayout combinedLayout = layout;
+				combinedLayout.u0 = minU; combinedLayout.v0 = minV;
+				combinedLayout.u1 = maxU; combinedLayout.v1 = minV;
+				combinedLayout.u2 = minU; combinedLayout.v2 = maxV;
+				combinedLayout.u3 = maxU; combinedLayout.v3 = maxV;
+				ExtractTexture(vram, combinedLayout, width, height, pixels);
+				std::string texFilename = std::string(icon->name) + ".png";
+				std::filesystem::path texPath = texOutputDir / texFilename;
+				stbi_write_png(texPath.string().c_str(), width, height, 4, pixels.data(), width * 4);
+			}
+		}
+
+		// Write texture section if there are any textures
+		size_t textureSectionOffset = 0;
+		if (!iconTextures.empty())
+		{
+			textureSectionOffset = currentOffset;
+			Log("    Writing texture section at offset 0x%zx (%zu textures)\n", textureSectionOffset, iconTextures.size());
+
+			// TextureSectionHeader
+			SH::TextureSectionHeader* output_TexSectionHeader = reinterpret_cast<SH::TextureSectionHeader*>(malloc(sizeof(SH::TextureSectionHeader)));
+			output_TexSectionHeader->numTextures = static_cast<uint32_t>(iconTextures.size());
+			currentOffset += sizeof(SH::TextureSectionHeader);
+			dataChunks.push_back({ sizeof(SH::TextureSectionHeader), output_TexSectionHeader });
+
+			// Texture offset array
+			const size_t texOffsetArraySize = iconTextures.size() * sizeof(uint32_t);
+			uint32_t* output_TexOffsetArray = reinterpret_cast<uint32_t*>(malloc(texOffsetArraySize));
+			currentOffset += texOffsetArraySize;
+			dataChunks.push_back({ texOffsetArraySize, output_TexOffsetArray });
+
+			// Write each texture
+			for (size_t i = 0; i < iconTextures.size(); i++)
+			{
+				const RawTextureData& tex = iconTextures[i];
+				output_TexOffsetArray[i] = static_cast<uint32_t>(currentOffset);
+
+				size_t pixelDataSize = tex.pixelData.size();
+				size_t paletteDataSize = tex.palette.size() * sizeof(uint16_t);
+				size_t totalSize = sizeof(SH::TextureDataHeader) + pixelDataSize + paletteDataSize;
+
+				uint8_t* output_TexData = reinterpret_cast<uint8_t*>(malloc(totalSize));
+
+				// Fill header
+				SH::TextureDataHeader* header = reinterpret_cast<SH::TextureDataHeader*>(output_TexData);
+				header->width = tex.width;
+				header->height = tex.height;
+				header->bpp = tex.bpp;
+				header->blendMode = tex.blendMode;
+				header->originU = tex.originU;
+				header->originV = tex.originV;
+				header->origPageX = tex.origPageX;
+				header->origPageY = tex.origPageY;
+				header->origPalX = tex.origPalX;
+				header->origPalY_lo = static_cast<uint8_t>(tex.origPalY & 0xFF);
+				header->origPalY_hi = static_cast<uint8_t>((tex.origPalY >> 8) & 0xFF);
+				header->padding = 0;
+
+				// Copy pixel and palette data
+				memcpy(output_TexData + sizeof(SH::TextureDataHeader), tex.pixelData.data(), pixelDataSize);
+				if (paletteDataSize > 0)
+				{
+					memcpy(output_TexData + sizeof(SH::TextureDataHeader) + pixelDataSize, tex.palette.data(), paletteDataSize);
+				}
+
+				currentOffset += totalSize;
+				dataChunks.push_back({ totalSize, output_TexData });
+			}
+
+			// Add 4-byte alignment padding if needed
+			size_t paddingNeeded = (currentOffset % 4 == 0) ? 0 : (4 - (currentOffset % 4));
+			if (paddingNeeded > 0)
+			{
+				uint8_t* padding = reinterpret_cast<uint8_t*>(calloc(paddingNeeded, 1));
+				currentOffset += paddingNeeded;
+				dataChunks.push_back({ paddingNeeded, padding });
+			}
+		}
+
+		// Patch CtrIconGroup header
+		output_Header->iconGroupOffset = static_cast<uint32_t>(iconGroupDataOffset);
+		output_Header->iconPatchTableOffset = static_cast<uint32_t>(patchTableOffset);
+		output_Header->textureDataOffset = static_cast<uint32_t>(textureSectionOffset);
+
+		// Write all chunks to file
+		for (const SH::WriteableObject& chunk : dataChunks)
+		{
+			outputFile.write(reinterpret_cast<const char*>(chunk.data), chunk.size);
+			free(chunk.data);
+		}
+
+		Log("    %s[OK]%s Wrote %s (%zu icons, %zu textures, %zu bytes)\n",
+		    ANSI_GREEN, ANSI_RESET, fileName.c_str(), icons.size(), iconTextures.size(), currentOffset);
+		return true;
+	};
+
+	// First, identify which icons belong to IconGroups (to avoid double-extraction)
+	std::unordered_set<const PSX::Icon*> iconsInGroups;
+
+	if (iconsLookup.numIconGroup > 0 && iconsLookup.offFirstIconGroupPtr != 0)
+	{
+		const uint32_t* iconGroupPtrArray = reinterpret_cast<const uint32_t*>(Deref(iconsLookup.offFirstIconGroupPtr));
+
+		for (uint32_t groupIdx = 0; groupIdx < iconsLookup.numIconGroup; groupIdx++)
+		{
+			const PSX::IconGroup& iconGroup = *reinterpret_cast<const PSX::IconGroup*>(Deref(iconGroupPtrArray[groupIdx]));
+			const uint32_t* iconPtrArray = reinterpret_cast<const uint32_t*>(
+				reinterpret_cast<const uint8_t*>(&iconGroup) + sizeof(PSX::IconGroup));
+
+			for (uint16_t iconIdx = 0; iconIdx < iconGroup.numIcons; iconIdx++)
+			{
+				const PSX::Icon* icon = reinterpret_cast<const PSX::Icon*>(Deref(iconPtrArray[iconIdx]));
+				iconsInGroups.insert(icon);
+			}
+		}
+	}
+
+	Log("  Found %zu icons belonging to IconGroups\n", iconsInGroups.size());
+
+	// Extract global/standalone icons (only those NOT belonging to any IconGroup)
+	Log("\n========================================\n");
+	Log("Extracting Global Icons (%u in main array, %zu in groups)\n", iconsLookup.numIcon, iconsInGroups.size());
+	Log("========================================\n");
+
+	if (iconsLookup.numIcon > 0 && iconsLookup.offFirstIcon != 0)
+	{
+		const PSX::Icon* globalIconArray = reinterpret_cast<const PSX::Icon*>(Deref(iconsLookup.offFirstIcon));
+		uint32_t extractedCount = 0;
+
+		for (uint32_t i = 0; i < iconsLookup.numIcon; i++)
+		{
+			const PSX::Icon& icon = globalIconArray[i];
+
+			// Skip icons that belong to an IconGroup
+			if (iconsInGroups.find(&icon) != iconsInGroups.end())
+			{
+				Log("  Skipping Icon %u: %s (belongs to IconGroup)\n", i, icon.name);
+				continue;
+			}
+
+			Log("  Global Icon %u: %s (index=%d)\n", i, icon.name, icon.global_IconArray_Index);
+
+			std::vector<const PSX::Icon*> singleIcon = { &icon };
+			std::string fileName = std::string("global_") + icon.name + ".ctricongroup";
+			WriteIconGroupFile(fileName, "", 0, true, singleIcon);
+			extractedCount++;
+		}
+
+		Log("  Extracted %u standalone global icons\n", extractedCount);
+	}
+	else
+	{
+		Log("  No global icons found\n");
+	}
+
+	// Extract icon groups
+	Log("\n========================================\n");
+	Log("Extracting Icon Groups (%u total)\n", iconsLookup.numIconGroup);
+	Log("========================================\n");
+
+	if (iconsLookup.numIconGroup > 0 && iconsLookup.offFirstIconGroupPtr != 0)
+	{
+		const uint32_t* iconGroupPtrArray = reinterpret_cast<const uint32_t*>(Deref(iconsLookup.offFirstIconGroupPtr));
+
+		for (uint32_t groupIdx = 0; groupIdx < iconsLookup.numIconGroup; groupIdx++)
+		{
+			const PSX::IconGroup& iconGroup = *reinterpret_cast<const PSX::IconGroup*>(Deref(iconGroupPtrArray[groupIdx]));
+			Log("\n  Group %u: %s (ID=%u, numIcons=%u)\n", groupIdx, iconGroup.name, iconGroup.groupID, iconGroup.numIcons);
+
+			// The icon pointers are stored immediately after the IconGroup structure
+			const uint32_t* iconPtrArray = reinterpret_cast<const uint32_t*>(
+				reinterpret_cast<const uint8_t*>(&iconGroup) + sizeof(PSX::IconGroup));
+
+			std::vector<const PSX::Icon*> groupIcons;
+			for (uint16_t iconIdx = 0; iconIdx < iconGroup.numIcons; iconIdx++)
+			{
+				const PSX::Icon* icon = reinterpret_cast<const PSX::Icon*>(Deref(iconPtrArray[iconIdx]));
+				Log("    Icon %u: %s (index=%d)\n", iconIdx, icon->name, icon->global_IconArray_Index);
+				groupIcons.push_back(icon);
+			}
+
+			std::string fileName = std::string("group_") + iconGroup.name + ".ctricongroup";
+			WriteIconGroupFile(fileName, iconGroup.name, iconGroup.groupID, false, groupIcons);
+		}
+	}
+	else
+	{
+		Log("  No icon groups found\n");
+	}
+
+	Log("\n========================================\n");
+	Log("%s[DONE]%s Icon extraction complete\n", ANSI_GREEN, ANSI_RESET);
+	Log("========================================\n");
+
+	#undef nameof
+}

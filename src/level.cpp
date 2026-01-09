@@ -50,12 +50,18 @@ void Level::OpenModelImporterWindow()
 	m_showModelImporterWindow = true;
 }
 
+void Level::OpenIconImporterWindow()
+{
+	m_showIconImporterWindow = true;
+}
+
 void Level::Clear(bool clearErrors)
 {
 	m_loaded = false;
 	m_showHotReloadWindow = false;
 	m_showModelExtractorWindow = false;
 	m_showModelImporterWindow = false;
+	m_showIconImporterWindow = false;
 	m_showExtractorLogWindow = false;
 	for (size_t i = 0; i < NUM_DRIVERS; i++) { m_spawn[i] = Spawn(); }
 	for (size_t i = 0; i < NUM_GRADIENT; i++) { m_skyGradient[i] = ColorGradient(); }
@@ -107,6 +113,46 @@ bool Level::ImportModel(const std::filesystem::path& ctrmodelPath)
 
 	printf("Imported model: %s (%zu bytes)\n", name.c_str(), ctrmodelData.size());
 	m_importedModels[name] = std::move(ctrmodelData);
+
+	return true;
+}
+
+bool Level::ImportIconGroup(const std::filesystem::path& ctricongroupPath)
+{
+	// Read entire file into memory
+	std::ifstream file(ctricongroupPath, std::ios::binary);
+	if (!file) { return false; }
+	std::vector<uint8_t> ctricongroupData{
+		std::istreambuf_iterator<char>(file),
+		std::istreambuf_iterator<char>()
+	};
+	file.close();
+
+	// Parse icon group header
+	const SH::CtrIconGroup* header = reinterpret_cast<const SH::CtrIconGroup*>(ctricongroupData.data());
+	const SH::IconGroupData* groupData = reinterpret_cast<const SH::IconGroupData*>(
+		ctricongroupData.data() + header->iconGroupOffset);
+
+	// Get group name (use filename if empty, e.g. for global icons)
+	std::string name(groupData->groupName, strnlen(groupData->groupName, sizeof(groupData->groupName)));
+	if (name.empty())
+	{
+		// For global icons, use the filename without extension
+		name = ctricongroupPath.stem().string();
+	}
+
+	// Create ImportedIconGroup
+	ImportedIconGroup iconGroup;
+	iconGroup.name = name;
+	iconGroup.importAsGlobal = (groupData->isGlobal != 0);
+	iconGroup.rawData = std::move(ctricongroupData);
+
+	printf("Imported icon group: %s (%u icons, %s, %zu bytes)\n",
+	       name.c_str(), groupData->numIcons,
+	       iconGroup.importAsGlobal ? "global" : "named group",
+	       iconGroup.rawData.size());
+
+	m_importedIconGroups[name] = std::move(iconGroup);
 
 	return true;
 }
@@ -904,6 +950,21 @@ bool Level::SaveLEV(const std::filesystem::path& path)
 	printf(nameof(offOxideGhost) " = %zx\n", offOxideGhost);
 	currOffset += m_oxideGhost.size();
 
+	// TODO: Minimap metadata - commented out for now (causes crash, needs investigation)
+	// PSX::Map minimapData = {};
+	// minimapData.worldStartX = -0x2800;
+	// minimapData.worldStartY = -0x2800;
+	// minimapData.worldEndX = 0x2800;
+	// minimapData.worldEndY = 0x2800;
+	// minimapData.iconSizeX = 64;   // Minimap icon width on screen
+	// minimapData.iconSizeY = 32;   // Minimap icon height on screen (half because top+bottom halves)
+	// minimapData.iconStartX = 462; // Center X position on screen
+	// minimapData.iconStartY = 216; // Bottom Y position on screen
+	// minimapData.mode = 0;         // 0 = no rotation
+	// const size_t offMinimapData = currOffset;
+	// printf(nameof(offMinimapData) " = %zx\n", offMinimapData);
+	// currOffset += sizeof(minimapData);
+
 	PSX::LevelExtraHeader extraHeader = {};
 	if (offTropyGhost > 0)
 	{
@@ -1042,6 +1103,79 @@ bool Level::SaveLEV(const std::filesystem::path& path)
 	currOffset += (uniqueModelNames.size() + 1) * sizeof(uint32_t);
 	header.offModels = static_cast<uint32_t>(offModelList_ptrArray);
 
+	// === ICON SERIALIZATION OFFSET CALCULATIONS ===
+	// Separate imported icons into global and named groups
+	std::vector<std::pair<std::string, const ImportedIconGroup*>> globalIconGroups;
+	std::vector<std::pair<std::string, const ImportedIconGroup*>> namedIconGroups;
+	for (const auto& [name, iconGroup] : m_importedIconGroups)
+	{
+		if (iconGroup.importAsGlobal)
+			globalIconGroups.emplace_back(name, &iconGroup);
+		else
+			namedIconGroups.emplace_back(name, &iconGroup);
+	}
+
+	// Count total icons for the combined icon array (global + named group icons)
+	size_t totalGlobalIcons = 0;  // Icons from importAsGlobal groups
+	size_t totalNamedGroupIcons = 0;  // Icons from named groups
+	for (const auto& [name, pGroup] : globalIconGroups)
+	{
+		const SH::CtrIconGroup* header_icon = reinterpret_cast<const SH::CtrIconGroup*>(pGroup->rawData.data());
+		const SH::IconGroupData* groupData = reinterpret_cast<const SH::IconGroupData*>(
+			pGroup->rawData.data() + header_icon->iconGroupOffset);
+		totalGlobalIcons += groupData->numIcons;
+	}
+	for (const auto& [name, pGroup] : namedIconGroups)
+	{
+		const SH::CtrIconGroup* header_icon = reinterpret_cast<const SH::CtrIconGroup*>(pGroup->rawData.data());
+		const SH::IconGroupData* groupData = reinterpret_cast<const SH::IconGroupData*>(
+			pGroup->rawData.data() + header_icon->iconGroupOffset);
+		totalNamedGroupIcons += groupData->numIcons;
+	}
+	size_t totalAllIcons = totalGlobalIcons + totalNamedGroupIcons;
+
+	// Calculate offsets for icon data
+	size_t offIconsLookup = 0;
+	size_t offGlobalIconArray = 0;
+	size_t offIconGroupPtrArray = 0;
+	std::vector<size_t> iconGroupOffsets;
+
+	if (!m_importedIconGroups.empty())
+	{
+		// Combined icon array (global icons first, then named group icons)
+		offGlobalIconArray = currOffset;
+		printf(nameof(offGlobalIconArray) " = %zx (%zu global + %zu named = %zu icons)\n",
+			offGlobalIconArray, totalGlobalIcons, totalNamedGroupIcons, totalAllIcons);
+		currOffset += totalAllIcons * sizeof(PSX::Icon);
+
+		// IconGroup structures (each followed by its icon pointer array)
+		for (const auto& [name, pGroup] : namedIconGroups)
+		{
+			const SH::CtrIconGroup* header_icon = reinterpret_cast<const SH::CtrIconGroup*>(pGroup->rawData.data());
+			const SH::IconGroupData* groupData = reinterpret_cast<const SH::IconGroupData*>(
+				pGroup->rawData.data() + header_icon->iconGroupOffset);
+
+			iconGroupOffsets.push_back(currOffset);
+			printf("offIconGroup[%s] = %zx (%u icons)\n", name.c_str(), currOffset, groupData->numIcons);
+			currOffset += sizeof(PSX::IconGroup);
+			currOffset += groupData->numIcons * sizeof(uint32_t); // Icon pointer array
+		}
+
+		// IconGroup pointer array (NULL-terminated)
+		offIconGroupPtrArray = currOffset;
+		printf(nameof(offIconGroupPtrArray) " = %zx\n", offIconGroupPtrArray);
+		currOffset += (namedIconGroups.size() + 1) * sizeof(uint32_t);
+
+		// LevIconsLookup
+		offIconsLookup = currOffset;
+		printf(nameof(offIconsLookup) " = %zx\n", offIconsLookup);
+		currOffset += sizeof(PSX::LevIconsLookup);
+
+		// Update header
+		header.offIconsLookup = static_cast<uint32_t>(offIconsLookup);
+		header.offIcons = static_cast<uint32_t>(offGlobalIconArray);
+	}
+
 #define CALCULATE_OFFSET(s, m, b) static_cast<uint32_t>(offsetof(s, m) + b)
 
 	const size_t offPaddingForMultOfFour = currOffset;
@@ -1118,6 +1252,7 @@ bool Level::SaveLEV(const std::filesystem::path& path)
 		}
 	}
 
+	// pointerMap.push_back(CALCULATE_OFFSET(PSX::LevelExtraHeader, offsets[PSX::LevelExtra::MINIMAP], offExtraHeader)); // TODO: commented out, causes crash
 	if (offTropyGhost != 0) { pointerMap.push_back(CALCULATE_OFFSET(PSX::LevelExtraHeader, offsets[PSX::LevelExtra::N_TROPY_GHOST], offExtraHeader)); }
 	if (offOxideGhost != 0) { pointerMap.push_back(CALCULATE_OFFSET(PSX::LevelExtraHeader, offsets[PSX::LevelExtra::N_OXIDE_GHOST], offExtraHeader)); }
 
@@ -1158,6 +1293,41 @@ bool Level::SaveLEV(const std::filesystem::path& path)
 		offCurrVisibleSet += sizeof(PSX::VisibleSet);
 	}
 
+	// Add icon pointer map entries
+	if (!m_importedIconGroups.empty())
+	{
+		// LevHeader icon pointers
+		pointerMap.push_back(CALCULATE_OFFSET(PSX::LevHeader, offIconsLookup, offHeader));
+		pointerMap.push_back(CALCULATE_OFFSET(PSX::LevHeader, offIcons, offHeader));
+
+		// LevIconsLookup pointers
+		pointerMap.push_back(CALCULATE_OFFSET(PSX::LevIconsLookup, offFirstIcon, offIconsLookup));
+		pointerMap.push_back(CALCULATE_OFFSET(PSX::LevIconsLookup, offFirstIconGroupPtr, offIconsLookup));
+
+		// IconGroup pointer array entries
+		for (size_t i = 0; i < iconGroupOffsets.size(); i++)
+		{
+			pointerMap.push_back(static_cast<uint32_t>(offIconGroupPtrArray + i * sizeof(uint32_t)));
+		}
+
+		// Icon pointer arrays within each IconGroup (pointers to global icon array entries)
+		size_t currIconGroupOffset = 0;
+		for (size_t groupIdx = 0; groupIdx < namedIconGroups.size(); groupIdx++)
+		{
+			const auto& [name, pGroup] = namedIconGroups[groupIdx];
+			const SH::CtrIconGroup* header_icon = reinterpret_cast<const SH::CtrIconGroup*>(pGroup->rawData.data());
+			const SH::IconGroupData* groupData = reinterpret_cast<const SH::IconGroupData*>(
+				pGroup->rawData.data() + header_icon->iconGroupOffset);
+
+			// Each icon pointer in the IconGroup's icon pointer array
+			size_t iconPtrArrayStart = iconGroupOffsets[groupIdx] + sizeof(PSX::IconGroup);
+			for (uint16_t i = 0; i < groupData->numIcons; i++)
+			{
+				pointerMap.push_back(static_cast<uint32_t>(iconPtrArrayStart + i * sizeof(uint32_t)));
+			}
+		}
+	}
+
 	#undef CALCULATE_OFFSET
 
 	const size_t pointerMapBytes = pointerMap.size() * sizeof(uint32_t);
@@ -1189,6 +1359,7 @@ bool Level::SaveLEV(const std::filesystem::path& path)
 	for (const std::vector<uint8_t>& serializedCheckpoint : serializedCheckpoints) { Write(file, serializedCheckpoint.data(), serializedCheckpoint.size()); }
 	if (!m_tropyGhost.empty()) { Write(file, m_tropyGhost.data(), m_tropyGhost.size()); }
 	if (!m_oxideGhost.empty()) { Write(file, m_oxideGhost.data(), m_oxideGhost.size()); }
+	// Write(file, &minimapData, sizeof(minimapData)); // TODO: commented out, causes crash
 	Write(file, &extraHeader, sizeof(extraHeader));
 	Write(file, navHeaders.data(), navHeaders.size() * sizeof(PSX::NavHeader));
 	Write(file, visMemNodesP1.data(), visMemNodesP1.size() * sizeof(uint32_t));
@@ -1380,6 +1551,176 @@ bool Level::SaveLEV(const std::filesystem::path& path)
 		Write(file, &ptr, sizeof(ptr));
 	}
 	Write(file, &nullTerm, sizeof(nullTerm));
+
+	// === ICON DATA WRITING ===
+	if (!m_importedIconGroups.empty())
+	{
+		// Track icon offsets for each named group (groupName -> starting offset in combined array)
+		std::unordered_map<std::string, size_t> namedGroupIconStartOffsets;
+		size_t currIconOffset = offGlobalIconArray;
+
+		// Helper lambda to patch TextureLayout with new VRAM coordinates
+		auto patchIconTexture = [this](PSX::Icon& icon, const std::string& groupName) {
+			// Calculate this icon's UV origin (minimum UV coordinates)
+			int iconMinU = std::min({icon.texLayout.u0, icon.texLayout.u1, icon.texLayout.u2, icon.texLayout.u3});
+			int iconMinV = std::min({icon.texLayout.v0, icon.texLayout.v1, icon.texLayout.v2, icon.texLayout.v3});
+
+			std::string iconName(icon.name, strnlen(icon.name, sizeof(icon.name)));
+			printf("  Patching icon '%s' (idx=%u) group='%s': origPage(%d,%d) origClut(%d,%d) origUV(%d,%d)\n",
+				iconName.c_str(), icon.global_IconArray_Index, groupName.c_str(),
+				icon.texLayout.texPage.x, icon.texLayout.texPage.y,
+				icon.texLayout.clut.x, icon.texLayout.clut.y, iconMinU, iconMinV);
+
+			bool matched = false;
+			for (const IconTextureForVRM& tex : m_iconTexturesInVRAM)
+			{
+				if (tex.iconGroupName == groupName && tex.placed)
+				{
+					// Match by texpage, clut, AND UV origin
+					if (tex.origPageX == icon.texLayout.texPage.x &&
+					    tex.origPageY == icon.texLayout.texPage.y &&
+					    tex.origPalX == icon.texLayout.clut.x &&
+					    tex.origPalY == icon.texLayout.clut.y &&
+					    tex.originU == iconMinU &&
+					    tex.originV == iconMinV)
+					{
+						size_t vramX = tex.imageX;
+						size_t vramY = tex.imageY;
+
+						printf("    MATCH: tex '%s' placed at VRAM(%zu,%zu) clut(%zu,%zu)\n",
+							tex.iconName.c_str(), vramX, vramY, tex.clutX, tex.clutY);
+						printf("    Old texPage(%d,%d) clut(%d,%d)\n",
+							icon.texLayout.texPage.x, icon.texLayout.texPage.y,
+							icon.texLayout.clut.x, icon.texLayout.clut.y);
+
+						icon.texLayout.texPage.x = static_cast<uint16_t>(vramX / 64);
+						icon.texLayout.texPage.y = static_cast<uint16_t>(vramY / 256);
+						icon.texLayout.clut.x = static_cast<uint16_t>(tex.clutX / 16);
+						icon.texLayout.clut.y = static_cast<uint16_t>(tex.clutY);
+
+						int uvStretch = (tex.bpp == 0) ? 4 : (tex.bpp == 1) ? 2 : 1;
+						int newOriginU = static_cast<int>((vramX % 64) * uvStretch);
+						int newOriginV = static_cast<int>(vramY % 256);
+						int deltaU = newOriginU - tex.originU;
+						int deltaV = newOriginV - tex.originV;
+
+						printf("    New texPage(%d,%d) clut(%d,%d) uvStretch=%d delta(%d,%d)\n",
+							icon.texLayout.texPage.x, icon.texLayout.texPage.y,
+							icon.texLayout.clut.x, icon.texLayout.clut.y, uvStretch, deltaU, deltaV);
+						printf("    Old UVs: (%d,%d) (%d,%d) (%d,%d) (%d,%d)\n",
+							icon.texLayout.u0, icon.texLayout.v0, icon.texLayout.u1, icon.texLayout.v1,
+							icon.texLayout.u2, icon.texLayout.v2, icon.texLayout.u3, icon.texLayout.v3);
+
+						icon.texLayout.u0 = static_cast<uint8_t>(icon.texLayout.u0 + deltaU);
+						icon.texLayout.v0 = static_cast<uint8_t>(icon.texLayout.v0 + deltaV);
+						icon.texLayout.u1 = static_cast<uint8_t>(icon.texLayout.u1 + deltaU);
+						icon.texLayout.v1 = static_cast<uint8_t>(icon.texLayout.v1 + deltaV);
+						icon.texLayout.u2 = static_cast<uint8_t>(icon.texLayout.u2 + deltaU);
+						icon.texLayout.v2 = static_cast<uint8_t>(icon.texLayout.v2 + deltaV);
+						icon.texLayout.u3 = static_cast<uint8_t>(icon.texLayout.u3 + deltaU);
+						icon.texLayout.v3 = static_cast<uint8_t>(icon.texLayout.v3 + deltaV);
+
+						printf("    New UVs: (%d,%d) (%d,%d) (%d,%d) (%d,%d)\n",
+							icon.texLayout.u0, icon.texLayout.v0, icon.texLayout.u1, icon.texLayout.v1,
+							icon.texLayout.u2, icon.texLayout.v2, icon.texLayout.u3, icon.texLayout.v3);
+
+						matched = true;
+						break;
+					}
+				}
+			}
+
+			if (!matched)
+			{
+				printf("    WARNING: No matching texture found! Available textures:\n");
+				for (const IconTextureForVRM& tex : m_iconTexturesInVRAM)
+				{
+					printf("      - group='%s' placed=%d origPage(%d,%d) origClut(%d,%d) originUV(%d,%d)\n",
+						tex.iconGroupName.c_str(), tex.placed,
+						tex.origPageX, tex.origPageY, tex.origPalX, tex.origPalY,
+						tex.originU, tex.originV);
+				}
+			}
+		};
+
+		// Write global icons first (icons from importAsGlobal groups)
+		for (const auto& [groupName, pGroup] : globalIconGroups)
+		{
+			const SH::CtrIconGroup* header_icon = reinterpret_cast<const SH::CtrIconGroup*>(pGroup->rawData.data());
+			const SH::IconGroupData* groupData = reinterpret_cast<const SH::IconGroupData*>(
+				pGroup->rawData.data() + header_icon->iconGroupOffset);
+			const PSX::Icon* srcIcons = reinterpret_cast<const PSX::Icon*>(groupData + 1);
+
+			for (uint16_t i = 0; i < groupData->numIcons; i++)
+			{
+				PSX::Icon icon = srcIcons[i];
+				patchIconTexture(icon, groupName);
+				Write(file, &icon, sizeof(icon));
+				currIconOffset += sizeof(PSX::Icon);
+			}
+		}
+
+		// Write named group icons (icons from named IconGroups, stored after global icons)
+		for (const auto& [groupName, pGroup] : namedIconGroups)
+		{
+			const SH::CtrIconGroup* header_icon = reinterpret_cast<const SH::CtrIconGroup*>(pGroup->rawData.data());
+			const SH::IconGroupData* groupData = reinterpret_cast<const SH::IconGroupData*>(
+				pGroup->rawData.data() + header_icon->iconGroupOffset);
+			const PSX::Icon* srcIcons = reinterpret_cast<const PSX::Icon*>(groupData + 1);
+
+			// Record starting offset for this group's icons
+			namedGroupIconStartOffsets[groupName] = currIconOffset;
+
+			for (uint16_t i = 0; i < groupData->numIcons; i++)
+			{
+				PSX::Icon icon = srcIcons[i];
+				patchIconTexture(icon, groupName);
+				Write(file, &icon, sizeof(icon));
+				currIconOffset += sizeof(PSX::Icon);
+			}
+		}
+
+		// Write IconGroup structures with their icon pointer arrays
+		for (size_t groupIdx = 0; groupIdx < namedIconGroups.size(); groupIdx++)
+		{
+			const auto& [groupName, pGroup] = namedIconGroups[groupIdx];
+			const SH::CtrIconGroup* header_icon = reinterpret_cast<const SH::CtrIconGroup*>(pGroup->rawData.data());
+			const SH::IconGroupData* groupData = reinterpret_cast<const SH::IconGroupData*>(
+				pGroup->rawData.data() + header_icon->iconGroupOffset);
+
+			// Write IconGroup header
+			PSX::IconGroup iconGroup;
+			memset(&iconGroup, 0, sizeof(iconGroup));
+			memcpy(iconGroup.name, groupData->groupName, sizeof(iconGroup.name));
+			iconGroup.groupID = groupData->groupID;
+			iconGroup.numIcons = groupData->numIcons;
+			Write(file, &iconGroup, sizeof(iconGroup));
+
+			// Write icon pointer array (pointers to this group's icons in the combined array)
+			size_t groupIconStart = namedGroupIconStartOffsets[groupName];
+			for (uint16_t i = 0; i < groupData->numIcons; i++)
+			{
+				uint32_t iconPtr = static_cast<uint32_t>(groupIconStart + i * sizeof(PSX::Icon));
+				Write(file, &iconPtr, sizeof(iconPtr));
+			}
+		}
+
+		// Write IconGroup pointer array (NULL-terminated)
+		for (size_t i = 0; i < iconGroupOffsets.size(); i++)
+		{
+			uint32_t ptr = static_cast<uint32_t>(iconGroupOffsets[i]);
+			Write(file, &ptr, sizeof(ptr));
+		}
+		Write(file, &nullTerm, sizeof(nullTerm));
+
+		// Write LevIconsLookup
+		PSX::LevIconsLookup iconsLookup;
+		iconsLookup.numIcon = static_cast<uint32_t>(totalAllIcons);  // All icons in the main array
+		iconsLookup.offFirstIcon = static_cast<uint32_t>(offGlobalIconArray);
+		iconsLookup.numIconGroup = static_cast<uint32_t>(namedIconGroups.size());
+		iconsLookup.offFirstIconGroupPtr = static_cast<uint32_t>(offIconGroupPtrArray);
+		Write(file, &iconsLookup, sizeof(iconsLookup));
+	}
 
 	uint32_t fourBytesOfZero = 0;
 	if (paddingSizeForMultOfFour > 0)
@@ -1967,7 +2308,90 @@ bool Level::UpdateVRM()
 		}
 	}
 
-	m_vrm = PackVRM(textures, m_modelTexturesInVRAM.empty() ? nullptr : &m_modelTexturesInVRAM);
+	// Extract textures from imported icon groups
+	m_iconTexturesInVRAM.clear();
+	for (const auto& [groupName, iconGroup] : m_importedIconGroups)
+	{
+		const SH::CtrIconGroup* ctrHeader = reinterpret_cast<const SH::CtrIconGroup*>(iconGroup.rawData.data());
+
+		// Skip if no texture section
+		if (ctrHeader->textureDataOffset == 0) { continue; }
+
+		// Get group data to access icons
+		const SH::IconGroupData* groupData = reinterpret_cast<const SH::IconGroupData*>(
+			iconGroup.rawData.data() + ctrHeader->iconGroupOffset);
+		const PSX::Icon* icons = reinterpret_cast<const PSX::Icon*>(groupData + 1);
+
+		// Parse texture section
+		const SH::TextureSectionHeader* texSection =
+			reinterpret_cast<const SH::TextureSectionHeader*>(iconGroup.rawData.data() + ctrHeader->textureDataOffset);
+
+		if (texSection->numTextures == 0) { continue; }
+
+		// Offset array follows header
+		const uint32_t* texOffsets = reinterpret_cast<const uint32_t*>(texSection + 1);
+
+		for (uint32_t i = 0; i < texSection->numTextures; i++)
+		{
+			const SH::TextureDataHeader* texData =
+				reinterpret_cast<const SH::TextureDataHeader*>(iconGroup.rawData.data() + texOffsets[i]);
+
+			IconTextureForVRM iconTex;
+			iconTex.iconGroupName = groupName;
+			// Get icon name if available
+			if (i < groupData->numIcons)
+			{
+				iconTex.iconName = std::string(icons[i].name, strnlen(icons[i].name, sizeof(icons[i].name)));
+			}
+			iconTex.textureIndex = i;
+			iconTex.width = texData->width;
+			iconTex.height = texData->height;
+			iconTex.bpp = texData->bpp;
+			iconTex.blendMode = texData->blendMode;
+			iconTex.origPageX = texData->origPageX;
+			iconTex.origPageY = texData->origPageY;
+			iconTex.origPalX = texData->origPalX;
+			iconTex.origPalY = texData->origPalY_lo | (texData->origPalY_hi << 8);
+			iconTex.originU = texData->originU;
+			iconTex.originV = texData->originV;
+
+			// Calculate pixel data size
+			size_t pixelDataSize = 0;
+			size_t paletteSize = 0;
+			if (texData->bpp == 0) // 4-bit
+			{
+				pixelDataSize = ((texData->width + 1) / 2) * texData->height;
+				paletteSize = 16;
+			}
+			else if (texData->bpp == 1) // 8-bit
+			{
+				pixelDataSize = texData->width * texData->height;
+				paletteSize = 256;
+			}
+			else // 16-bit
+			{
+				pixelDataSize = texData->width * texData->height * 2;
+				paletteSize = 0;
+			}
+
+			// Copy pixel data
+			const uint8_t* pixelStart = reinterpret_cast<const uint8_t*>(texData + 1);
+			iconTex.pixelData.assign(pixelStart, pixelStart + pixelDataSize);
+
+			// Copy palette data (if indexed)
+			if (paletteSize > 0)
+			{
+				const uint16_t* paletteStart = reinterpret_cast<const uint16_t*>(pixelStart + pixelDataSize);
+				iconTex.palette.assign(paletteStart, paletteStart + paletteSize);
+			}
+
+			m_iconTexturesInVRAM.push_back(std::move(iconTex));
+		}
+	}
+
+	m_vrm = PackVRM(textures,
+		m_modelTexturesInVRAM.empty() ? nullptr : &m_modelTexturesInVRAM,
+		m_iconTexturesInVRAM.empty() ? nullptr : &m_iconTexturesInVRAM);
 	if (m_vrm.empty()) { return false; }
 
 	for (auto& [from, to] : copyTextureAttributes)

@@ -450,7 +450,7 @@ static bool FindAvailableSpace(std::vector<bool>& vramUsed, size_t width, size_t
 	return false;
 }
 
-std::vector<uint8_t> PackVRM(std::vector<Texture*>& textures, std::vector<ModelTextureForVRM>* modelTextures)
+std::vector<uint8_t> PackVRM(std::vector<Texture*>& textures, std::vector<ModelTextureForVRM>* modelTextures, std::vector<IconTextureForVRM>* iconTextures)
 {
 	bool empty = true;
 	std::vector<Texture*> cachedTextures;
@@ -514,6 +514,34 @@ std::vector<uint8_t> PackVRM(std::vector<Texture*>& textures, std::vector<ModelT
 		}
 	}
 
+	// Place icon textures
+	if (iconTextures)
+	{
+		for (IconTextureForVRM& iconTex : *iconTextures)
+		{
+			// Convert raw PSX bytes to VRAM format
+			std::vector<uint16_t> vramPixels = ConvertRawPSXToVRAM(
+				iconTex.pixelData, iconTex.width, iconTex.height, iconTex.bpp);
+
+			int vramWidth = GetVRAMWidthForBPP(iconTex.width, iconTex.bpp);
+
+			size_t x, y;
+			if (!FindAvailableSpace(vramUsed, vramWidth, iconTex.height, x, y, false))
+			{
+				printf("Warning: Failed to place icon texture %s/%s[%zu] in VRAM\n",
+				       iconTex.iconGroupName.c_str(), iconTex.iconName.c_str(), iconTex.textureIndex);
+				iconTex.placed = false;
+				continue;
+			}
+
+			empty = false;
+			iconTex.imageX = x;
+			iconTex.imageY = y;
+			iconTex.placed = true;
+			BufferToVRM(vram, vramUsed, vramPixels, x, y, vramWidth);
+		}
+	}
+
 	if (empty) { return std::vector<uint8_t>(); }
 
 	// Place level texture CLUTs
@@ -555,6 +583,29 @@ std::vector<uint8_t> PackVRM(std::vector<Texture*>& textures, std::vector<ModelT
 			modelTex.clutX = x;
 			modelTex.clutY = y;
 			BufferToVRM(vram, vramUsed, modelTex.palette, x, y, modelTex.palette.size());
+		}
+	}
+
+	// Place icon texture CLUTs
+	if (iconTextures)
+	{
+		for (IconTextureForVRM& iconTex : *iconTextures)
+		{
+			if (!iconTex.placed) { continue; }
+			if (iconTex.bpp == 2) { continue; } // 16-bit has no CLUT
+
+			size_t x, y;
+			if (!FindAvailableSpace(vramUsed, iconTex.palette.size(), 1, x, y, true))
+			{
+				printf("Warning: Failed to place icon CLUT %s/%s[%zu] in VRAM\n",
+				       iconTex.iconGroupName.c_str(), iconTex.iconName.c_str(), iconTex.textureIndex);
+				iconTex.placed = false;
+				continue;
+			}
+
+			iconTex.clutX = x;
+			iconTex.clutY = y;
+			BufferToVRM(vram, vramUsed, iconTex.palette, x, y, iconTex.palette.size());
 		}
 	}
 
