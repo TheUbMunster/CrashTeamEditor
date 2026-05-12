@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ImportGroup Label="PropertySheets" />
+  <PropertyGroup Label="UserMacros">
+    <PYTHON_EMBED_HOME>$(SolutionDir)python</PYTHON_EMBED_HOME>
+    <PYTHON_HOME>$(SolutionDir)python</PYTHON_HOME>
+    <PYTHON_INCLUDE_DIR>$(SolutionDir)python\include</PYTHON_INCLUDE_DIR>
+  </PropertyGroup>
+  <PropertyGroup />
+  <ItemDefinitionGroup />
+  <ItemGroup>
+    <BuildMacro Include="PYTHON_EMBED_HOME">
+      <Value>$(PYTHON_EMBED_HOME)</Value>
+      <EnvironmentVariable>true</EnvironmentVariable>
+    </BuildMacro>
+    <BuildMacro Include="PYTHON_HOME">
+      <Value>$(PYTHON_HOME)</Value>
+      <EnvironmentVariable>true</EnvironmentVariable>
+    </BuildMacro>
+    <BuildMacro Include="PYTHON_INCLUDE_DIR">
+      <Value>$(PYTHON_INCLUDE_DIR)</Value>
+      <EnvironmentVariable>true</EnvironmentVariable>
+    </BuildMacro>
+  </ItemGroup>
+</Project>
