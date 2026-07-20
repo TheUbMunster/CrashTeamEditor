@@ -10,6 +10,20 @@ namespace PSX
 {
 	static constexpr size_t MAX_NUM_PLAYERS = 4;
 
+	// Command list encoding. See RenderBucket_DrawFunc_Normal in the game's
+	// RenderBucket_QueueExecute.c -- all five DrawFunc variants share this logic.
+	static constexpr uint32_t CMD_TERMINATOR = 0xFFFFFFFF;
+	// (command & CMD_COLOR_ONLY_MASK) == 0 means a color-only command: it consumes no
+	// vertex, and its low 9 bits are a color index rather than a texture index.
+	static constexpr uint32_t CMD_COLOR_ONLY_MASK = 0xFFFF0000;
+	// Bit 26. Set means "reuse the cached vertex at stackIndex" -- no vertex consumed.
+	static constexpr uint32_t CMD_REUSE_VERTEX_FLAG = 0x04000000;
+	static constexpr uint32_t CMD_TEX_INDEX_MASK = 0x1FF;
+
+	// ModelAnim::numFrames encoding.
+	static constexpr uint16_t ANIM_INTERPOLATED_BIT = 0x8000;
+	static constexpr uint16_t ANIM_FRAME_COUNT_MASK = 0x7FFF;
+
 	struct Vec3b
 	{
 		int8_t x;
@@ -193,7 +207,10 @@ namespace PSX
 		uint32_t offBuildType; // 0xE8
 		uint8_t unk_0xEC[0x18]; // 0xEC // 0x18 0x0's
 		PSX::Weather weather; // 0x104
-		uint32_t offExtra; // 0x134
+		// 0x134 -- points to a LevelExtraHeader (the game's struct SpawnType1,
+		// reached as gGT->level1->ptrSpawnType1). Holds minimap, hazard spawn
+		// timings, camera paths and ghost data.
+		uint32_t offExtra;
 		uint32_t numSpawnType_2; // 0x138
 		uint32_t offSpawnType_2; // 0x13C
 		uint32_t numSpawnType_2_posRot; // 0x140
@@ -323,9 +340,13 @@ namespace PSX
 		// 0x2C
 		uint32_t offColors; // CLUT = color lookup table
 
-		// 0x30
-		// same as anim->0x14
-		uint32_t unk3;
+		// 0x30 (was: unk3)
+		// Per-vertex bit-width table for compressed vertices, numVerts * uint32_t.
+		// Only read when this model is NOT animated (offAnimations == 0); the animated
+		// path uses ModelAnim::offDeltaArray instead. See RenderBucket_GetFrame:
+		//   if (mh->ptrAnimations == 0) { *deltaArrayOut = mh->unk3; ... }
+		// 0 => frame data stores uncompressed 3-byte vertices.
+		uint32_t offStaticDeltaArray;
 
 		// 0x34
 		uint32_t numAnimations;
@@ -366,7 +387,46 @@ namespace PSX
 		int16_t maybePosMaybePadding; // usually 0x0
 		char unk16[16]; // sixteen 0x0
 		int vertexOffset; // usually 0x1C
+
+		// vertex payload follows at (this + vertexOffset):
+		//   uncompressed: numVerts * Vec3b
+		//   compressed:   MSB-first bitstream described by the delta array
 	};
+
+	// One animation of a model LOD. numStoredFrames frames follow inline at +0x18,
+	// each exactly frameSize bytes: a ModelFrame followed by its vertex payload.
+	// ModelHeader::offAnimations points to an array of numAnimations pointers to these
+	// (no terminator -- RenderBucket_GetAnim indexes it directly).
+	struct ModelAnim
+	{
+		// 0x0 -- name of the animation
+		char name[0x10];
+
+		// 0x10
+		// Low 15 bits (ANIM_FRAME_COUNT_MASK) = logical frame count.
+		// ANIM_INTERPOLATED_BIT set = the game halves the frame index and blends
+		// frame[i] with frame[i+1], so roughly half as many frames are stored.
+		uint16_t numFrames;
+
+		// 0x12 -- byte stride between consecutive stored frames
+		int16_t frameSize;
+
+		// 0x14 -- per-vertex bit-width table, numVerts * uint32_t. Shared by every
+		// frame of this animation (which is why frameSize is constant).
+		// 0 => frames store uncompressed 3-byte vertices.
+		uint32_t offDeltaArray;
+
+		// 0x18 -- frames follow inline
+	};
+
+	// Number of frames actually stored for an animation. Derived by pushing the max
+	// reachable animFrame (count - 1) through RenderBucket_GetFrame: for interpolated
+	// animations both index parities land on the same highest touched frame.
+	inline size_t StoredFrameCount(uint16_t numFrames)
+	{
+		const size_t count = numFrames & ANIM_FRAME_COUNT_MASK;
+		return (numFrames & ANIM_INTERPOLATED_BIT) ? ((count >> 1) + 1) : count;
+	}
 
 	struct MeshInfo
 	{
@@ -381,21 +441,36 @@ namespace PSX
 	};
 
 	/* TODO: Figure out what each value actually is for and properly name them */
+	// Index into LevelExtraHeader::offsets. The game calls this struct SpawnType1 and
+	// reaches it via LevHeader::offExtra.
 	enum LevelExtra
 	{
 		MINIMAP = 0,
-		SPAWN = 1, // what
+		// Array of int16_t "cycle timing" values, one per hazard instance. Hazard
+		// birth handlers index it by the LAST DIGIT OF THE INSTANCE NAME:
+		//   timeAtEdge = metaArray[inst->name[strlen(inst->name) - 1] - '0'];
+		// which is why vanilla names them "armadillo#0", "armadillo#1", ... The
+		// handlers do NOT null-check this pointer. See the SaveLEV gotcha note.
+		SPAWN = 1,
 		CAMERA_END_OF_RACE = 2,
 		CAMERA_DEMO = 3,
 		N_TROPY_GHOST = 4,
 		N_OXIDE_GHOST = 5,
-		CREDITS = 6, // what
+		CREDITS = 6, // only read on the credits sequence
 		COUNT = 7,
 	};
 
+	// Known to the game as struct SpawnType1. Pointed to by LevHeader::offExtra.
 	struct LevelExtraHeader
 	{
+		// Number of valid entries in offsets[]. Consumers gate on it before reading:
+		// hazard handlers need > 0, camera code needs >= 3. Vanilla uses 4 (no ghost
+		// data) or 6 (with ghosts); the only vanilla levels with 0 are the 28 battle
+		// arenas, which contain no hazards and so never reach the hazard path.
 		uint32_t count;
+
+		// Every non-zero entry is a pointer and MUST be registered in SaveLEV's
+		// pointerMap, or it reaches the game as an unrelocated raw file offset.
 		uint32_t offsets[LevelExtra::COUNT];
 	};
 
@@ -541,6 +616,9 @@ namespace PSX
 
 	static_assert(sizeof(SkyboxVertex) == 0xc, "SkyboxVertex must be 0xc bytes");
 	static_assert(sizeof(Skybox) == 0x38, "Skybox header must be 0x38 bytes");
+	static_assert(sizeof(ModelFrame) == 0x1c, "ModelFrame must be 0x1c bytes");
+	static_assert(sizeof(ModelHeader) == 0x40, "ModelHeader must be 0x40 bytes");
+	static_assert(sizeof(ModelAnim) == 0x18, "ModelAnim must be 0x18 bytes");
 }
 
 template<>

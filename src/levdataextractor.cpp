@@ -24,6 +24,261 @@ void LevDataExtractor::Log(const char* format, ...)
 	m_log += buffer;
 }
 
+// Explicit little-endian load. LEV pointers have no guaranteed 4-byte alignment
+// relative to m_levData.data(), so we can't just deref a uint32_t*. Mirrors
+// RenderBucket_ReadPackedWord in the game.
+static inline uint32_t ReadU32(const uint8_t* p)
+{
+	return static_cast<uint32_t>(p[0])
+	     | (static_cast<uint32_t>(p[1]) << 8)
+	     | (static_cast<uint32_t>(p[2]) << 16)
+	     | (static_cast<uint32_t>(p[3]) << 24);
+}
+
+static inline size_t Align4(size_t value)
+{
+	return (value + 3) & ~static_cast<size_t>(3);
+}
+
+bool LevDataExtractor::InLevBounds(uint32_t offset, size_t size) const
+{
+	if (offset == 0) { return false; }
+	// Deref() adds 4: offsets are from start of file + 4.
+	const uint64_t start = static_cast<uint64_t>(offset) + 4;
+	return start + size <= m_levData.size();
+}
+
+bool LevDataExtractor::ScanCommandList(uint32_t offCommandList, SH::CommandListScan& out)
+{
+	out = SH::CommandListScan{};
+
+	// Need at least the color-count word plus a terminator.
+	if (!InLevBounds(offCommandList, 8))
+	{
+		out.rejectReason = "command list offset out of bounds";
+		return false;
+	}
+
+	const uint8_t* base = m_levData.data() + offCommandList + 4;
+	out.colorCount = ReadU32(base);
+
+	const uint8_t* commands = base + 4;
+	const size_t maxCommands = (m_levData.size() - (static_cast<size_t>(offCommandList) + 8)) / 4;
+
+	size_t i = 0;
+	for (; i < maxCommands; i++)
+	{
+		const uint32_t command = ReadU32(commands + i * 4);
+		if (command == PSX::CMD_TERMINATOR) { break; }
+
+		// Color-only command: consumes no vertex, and its low bits are color indices,
+		// NOT a texture index. See RenderBucket_ApplyColorOnlyCommand.
+		if ((command & PSX::CMD_COLOR_ONLY_MASK) == 0)
+		{
+			out.maxColorCoordIndex = std::max({ out.maxColorCoordIndex,
+			                                    (command >> 9) & 0x7Fu,   // colorA: (cmd >> 7) & 0x1fc, /4
+			                                    (command >> 2) & 0x7Fu }); // colorB: cmd & 0x1fc, /4
+			continue;
+		}
+
+		out.maxTexCoordIndex = std::max(out.maxTexCoordIndex, command & PSX::CMD_TEX_INDEX_MASK);
+		out.maxColorCoordIndex = std::max(out.maxColorCoordIndex, (command >> 9) & 0x7Fu);
+
+		if ((command & PSX::CMD_REUSE_VERTEX_FLAG) == 0) { out.numVerts++; }
+	}
+
+	if (i >= maxCommands)
+	{
+		out.rejectReason = "unterminated command list";
+		return false;
+	}
+
+	out.numCommands = i;
+	out.byteSize = 4 + (i + 1) * sizeof(uint32_t);
+	out.valid = true;
+	return true;
+}
+
+// Exact byte length of a compressed vertex payload. Each vertex has one u32 descriptor
+// in the delta array giving three 3-bit component widths; each component consumes
+// (width + 1) bits from an MSB-first bitstream. See RenderBucket_UncompressAnimationFrame
+// and RenderBucket_ReadDeltaComponentFromStream.
+bool LevDataExtractor::ComputeCompressedPayload(uint32_t offDeltaArray, size_t numVerts,
+                                                size_t& outPayloadBytes, size_t& outSafeReadBytes)
+{
+	const size_t deltaArrayBytes = numVerts * sizeof(uint32_t);
+	if (!InLevBounds(offDeltaArray, deltaArrayBytes)) { return false; }
+
+	const uint8_t* deltaArray = m_levData.data() + offDeltaArray + 4;
+
+	uint64_t totalBits = 0;
+	for (size_t i = 0; i < numVerts; i++)
+	{
+		const uint32_t descriptor = ReadU32(deltaArray + i * sizeof(uint32_t));
+		totalBits += ((descriptor >> 6) & 7) + ((descriptor >> 3) & 7) + (descriptor & 7) + 3;
+	}
+
+	outPayloadBytes = static_cast<size_t>((totalBits + 7) / 8);
+	// RenderBucket_GetSignedBits may touch the word at (bitIndex >> 5) + 1 when a field
+	// straddles a word boundary, so the game can read further than the payload proper.
+	outSafeReadBytes = static_cast<size_t>(((totalBits >> 5) + 2) * sizeof(uint32_t));
+	return true;
+}
+
+// Checks that no two claimed byte ranges partially overlap. Exact duplicates are legal --
+// several animations commonly share one delta array, and TextureLayouts are reused -- but
+// a partial overlap means some computed size is too large. Also reports gaps, which
+// suggest a size is too small or that there is data we don't model. Returns false only on
+// overlap; gaps are logged as warnings.
+bool LevDataExtractor::ValidateExtents(std::vector<SH::LevExtent>& extents, const char* modelName)
+{
+	if (extents.empty()) { return true; }
+
+	std::sort(extents.begin(), extents.end(),
+	          [](const SH::LevExtent& a, const SH::LevExtent& b) {
+		          return a.start != b.start ? a.start < b.start : a.end < b.end;
+	          });
+
+	bool ok = true;
+	for (size_t i = 1; i < extents.size(); i++)
+	{
+		const SH::LevExtent& prev = extents[i - 1];
+		const SH::LevExtent& cur = extents[i];
+
+		// Exact duplicate -- a legitimately shared block.
+		if (prev.start == cur.start && prev.end == cur.end) { continue; }
+
+		if (cur.start < prev.end)
+		{
+			Log("  [!] EXTENT OVERLAP in model %s: '%s' [0x%X,0x%X) overlaps '%s' [0x%X,0x%X)\n",
+			       modelName, prev.label.c_str(), prev.start, prev.end,
+			       cur.label.c_str(), cur.start, cur.end);
+			ok = false;
+			continue;
+		}
+
+		if (cur.start - prev.end > 4)
+		{
+			Log("  [~] extent gap in model %s: %u bytes between '%s' (ends 0x%X) and '%s' (starts 0x%X)\n",
+			       modelName, cur.start - prev.end, prev.label.c_str(), prev.end,
+			       cur.label.c_str(), cur.start);
+		}
+	}
+	return ok;
+}
+
+bool LevDataExtractor::ValidateAnim(uint32_t offAnim, size_t numVerts, SH::AnimExtent& out)
+{
+	out = SH::AnimExtent{};
+	out.offAnim = offAnim;
+
+	if (!InLevBounds(offAnim, sizeof(PSX::ModelAnim)))
+	{
+		out.rejectReason = "ModelAnim header out of bounds";
+		return false;
+	}
+
+	const PSX::ModelAnim& anim = *reinterpret_cast<const PSX::ModelAnim*>(m_levData.data() + offAnim + 4);
+
+	const size_t logicalFrames = anim.numFrames & PSX::ANIM_FRAME_COUNT_MASK;
+	if (logicalFrames == 0)
+	{
+		// The game guards this too (RenderBucket_GetFrame).
+		out.rejectReason = "animation has zero frames";
+		return false;
+	}
+
+	if (anim.frameSize <= 0 || (anim.frameSize % 4) != 0 || anim.frameSize > 0x8000)
+	{
+		out.rejectReason = "implausible frameSize " + std::to_string(anim.frameSize);
+		return false;
+	}
+
+	out.frameSize = static_cast<size_t>(anim.frameSize);
+	out.numStoredFrames = PSX::StoredFrameCount(anim.numFrames);
+	out.offDeltaArray = anim.offDeltaArray;
+
+	if (out.numStoredFrames > 4096)
+	{
+		out.rejectReason = "implausible frame count " + std::to_string(out.numStoredFrames);
+		return false;
+	}
+
+	// Size comes from the stored stride, not from the vertex math -- so extraction
+	// stays correct even if our understanding of the encoding is off, and any trailing
+	// per-frame padding is preserved verbatim.
+	out.animBlockBytes = sizeof(PSX::ModelAnim) + out.numStoredFrames * out.frameSize;
+	if (!InLevBounds(offAnim, out.animBlockBytes))
+	{
+		out.rejectReason = "animation frame block (" + std::to_string(out.animBlockBytes) + " bytes) runs past end of file";
+		return false;
+	}
+
+	// Vertex payload length, used only to cross-check frameSize.
+	size_t safeReadBytes = 0;
+	if (out.offDeltaArray != 0)
+	{
+		if (!ComputeCompressedPayload(out.offDeltaArray, numVerts, out.payloadBytes, safeReadBytes))
+		{
+			out.rejectReason = "delta array out of bounds";
+			return false;
+		}
+		out.deltaArrayBytes = numVerts * sizeof(uint32_t);
+	}
+	else
+	{
+		out.payloadBytes = numVerts * 3;
+		safeReadBytes = out.payloadBytes;
+	}
+
+	// Per-frame validation. vertexOffset is usually 0x1C but genuinely varies in vanilla
+	// data (0x20/0x24/0x28 occur in adv_player_select and menu_models), so we require it
+	// to be uniform across the animation rather than any particular value -- the game
+	// applies frame i's vertexOffset to frame i+1 when interpolating
+	// (RenderBucket_PrepareDrawContext), so a varying value would be a real inconsistency.
+	// Animated blocks are copied verbatim by stride, so a non-standard offset is preserved.
+	for (size_t i = 0; i < out.numStoredFrames; i++)
+	{
+		const uint32_t offFrame = static_cast<uint32_t>(offAnim + sizeof(PSX::ModelAnim) + i * out.frameSize);
+		const PSX::ModelFrame& frame = *reinterpret_cast<const PSX::ModelFrame*>(m_levData.data() + offFrame + 4);
+
+		if (i == 0)
+		{
+			if (frame.vertexOffset < static_cast<int>(sizeof(PSX::ModelFrame)))
+			{
+				out.rejectReason = "frame 0 has vertexOffset 0x" + std::to_string(frame.vertexOffset)
+				                 + ", which overlaps the ModelFrame header";
+				return false;
+			}
+			out.vertexOffset = static_cast<size_t>(frame.vertexOffset);
+		}
+		else if (static_cast<size_t>(frame.vertexOffset) != out.vertexOffset)
+		{
+			out.rejectReason = "frame " + std::to_string(i) + " has vertexOffset 0x"
+			                 + std::to_string(frame.vertexOffset) + " but frame 0 has 0x"
+			                 + std::to_string(out.vertexOffset);
+			return false;
+		}
+
+		if (out.vertexOffset + out.payloadBytes > out.frameSize)
+		{
+			out.rejectReason = "frame " + std::to_string(i) + " payload ("
+			                 + std::to_string(out.payloadBytes) + " bytes at 0x"
+			                 + std::to_string(out.vertexOffset) + ") overflows frameSize "
+			                 + std::to_string(out.frameSize);
+			return false;
+		}
+
+		if (!InLevBounds(offFrame + frame.vertexOffset, safeReadBytes))
+		{
+			out.rejectReason = "frame " + std::to_string(i) + " vertex payload runs past end of file";
+			return false;
+		}
+	}
+
+	return true;
+}
+
 void LevDataExtractor::ParseVrmIntoVram(VramBuffer& vram)
 {
 	if (m_vrmData.empty())
@@ -373,6 +628,14 @@ void LevDataExtractor::ExtractModels(void)
 		// Generate patch table - track all pointer offsets for SaveLEV to patch when embedding
 		std::vector<uint32_t> patchTable;
 
+		// Every byte range we claim from the source LEV, for the overlap self-check.
+		std::vector<SH::LevExtent> levExtents;
+		auto RecordExtent = [&levExtents](uint32_t start, size_t size, std::string label) {
+			if (start == 0 || size == 0) { return; }
+			levExtents.push_back({ start, static_cast<uint32_t>(start + size), std::move(label) });
+		};
+		RecordExtent(model.offHeaders, model.numHeaders * sizeof(PSX::ModelHeader), "model headers");
+
 		// Add offset of Model.offHeaders field
 		patchTable.push_back(CALCULATE_OFFSET(PSX::Model, offHeaders, modelOffset));
 
@@ -386,32 +649,46 @@ void LevDataExtractor::ExtractModels(void)
 			Log("    Scale: (%d, %d, %d)\n", modelHeader.scale.x, modelHeader.scale.y, modelHeader.scale.z);
 			Log("    offTexLayout %d\n", modelHeader.offTexLayout);
 
-			if (modelHeader.offFrameData == (uint32_t)nullptr ||
-				  modelHeader.numAnimations != 0 ||
-					modelHeader.offAnimations != (uint32_t)nullptr ||
-					modelHeader.offAnimtex != (uint32_t)nullptr
-				 )
+			// A model LOD is animated iff offAnimations is set; RenderBucket_GetFrame reads
+			// offFrameData only when it isn't. Collect every reason rather than bailing on
+			// the first, so one extraction run reports the whole remaining gap.
+			const bool isAnimated = modelHeader.offAnimations != (uint32_t)nullptr;
 			{
-				Log("    [!] SKIPPING: Unsupported features detected\n");
-				if (modelHeader.offFrameData == (uint32_t)nullptr) Log("      - No frame data\n");
-				if (modelHeader.numAnimations != 0) Log("      - Has animations (%u)\n", modelHeader.numAnimations);
-				if (modelHeader.offAnimations != (uint32_t)nullptr) Log("      - Has animation data\n");
-				if (modelHeader.offAnimtex != (uint32_t)nullptr) Log("      - Has animated textures\n");
-				isSupportedByCurrentTechnology = false;
-				break;
-			}
+				std::vector<std::string> rejectReasons;
 
-			if (modelHeader.unk1 != 0 ||
-				  modelHeader.maybeScaleMaybePadding != 0 ||
-				  modelHeader.unk3 != 0)
-			{
-				Log("    [!] SKIPPING: Unexpected non-zero fields\n");
-				if (modelHeader.unk1 != 0) Log("      - unk1 = 0x%08X\n", modelHeader.unk1);
-				if (modelHeader.maybeScaleMaybePadding != 0) Log("      - maybeScaleMaybePadding = 0x%04X\n", modelHeader.maybeScaleMaybePadding);
-				if (modelHeader.unk3 != 0) Log("      - unk3 = 0x%08X\n", modelHeader.unk3);
-				Log("      TODO: Investigate if these fields are safe to ignore\n");
-				isSupportedByCurrentTechnology = false;
-				break;
+				// Still unsupported.
+				if (modelHeader.offAnimtex != (uint32_t)nullptr)
+					rejectReasons.push_back("has animated textures (offAnimtex points outside the model, no relocation story yet)");
+				if (modelHeader.unk1 != 0)
+					rejectReasons.push_back("unk1 = 0x" + std::to_string(modelHeader.unk1) + " (unknown, may be a pointer)");
+				if (modelHeader.maybeScaleMaybePadding != 0)
+					rejectReasons.push_back("maybeScaleMaybePadding = 0x" + std::to_string(modelHeader.maybeScaleMaybePadding) + " (unknown)");
+
+				// The game itself bails on these (RenderBucket_PrepareDrawContext).
+				if (modelHeader.offCommandList == (uint32_t)nullptr)
+					rejectReasons.push_back("no command list");
+				if (modelHeader.offColors == (uint32_t)nullptr)
+					rejectReasons.push_back("no colors");
+
+				// Internally inconsistent headers -- our model of the format would be wrong.
+				if ((modelHeader.numAnimations != 0) != isAnimated)
+					rejectReasons.push_back("numAnimations and offAnimations disagree");
+				if (isAnimated && modelHeader.offFrameData != (uint32_t)nullptr)
+					rejectReasons.push_back("both offFrameData and offAnimations set (ambiguous; GetFrame never reads offFrameData when animated)");
+				if (!isAnimated && modelHeader.offFrameData == (uint32_t)nullptr)
+					rejectReasons.push_back("neither offFrameData nor offAnimations set");
+				if (isAnimated && modelHeader.offStaticDeltaArray != 0)
+					rejectReasons.push_back("offStaticDeltaArray = 0x" + std::to_string(modelHeader.offStaticDeltaArray) + " on an animated model (never read by GetFrame -- format model may be wrong)");
+				if (modelHeader.numAnimations > 256)
+					rejectReasons.push_back("numAnimations = " + std::to_string(modelHeader.numAnimations) + " exceeds sanity cap of 256");
+
+				if (!rejectReasons.empty())
+				{
+					Log("    [!] SKIPPING: %zu unsupported/invalid feature(s)\n", rejectReasons.size());
+					for (const std::string& reason : rejectReasons) { Log("      - %s\n", reason.c_str()); }
+					isSupportedByCurrentTechnology = false;
+					break;
+				}
 			}
 
 			// Get pointer to THIS header within the pre-allocated block
@@ -423,6 +700,8 @@ void LevDataExtractor::ExtractModels(void)
       output_ModelHeader->offFrameData = 0; //patch later
       output_ModelHeader->offTexLayout = 0; //patch later
       output_ModelHeader->offColors = 0; //patch later
+      output_ModelHeader->offStaticDeltaArray = 0; //patch later
+      output_ModelHeader->offAnimations = 0; //patch later
 
 			// Declare offset variables at loop scope so they're accessible when patching
 			size_t unkNumOffset = 0;
@@ -430,32 +709,31 @@ void LevDataExtractor::ExtractModels(void)
 			size_t frameDataOffset = 0;
 			size_t texLayoutOffset = 0;
 			size_t clutOffset = 0;
+			size_t staticDeltaArrayOffset = 0;
+			size_t animPtrArrayOffset = 0;
 
 			// Command list structure: [unkNum:u32] [commands...] [0xFFFFFFFF terminator]
-			const uint8_t* commandListPtr = Deref(modelHeader.offCommandList);
-			const uint32_t unkNum = *reinterpret_cast<const uint32_t*>(commandListPtr);
-			const PSX::InstDrawCommand* commandList = reinterpret_cast<const PSX::InstDrawCommand*>(commandListPtr + 4);
-
-			Log("    Command list unkNum: %u (0x%08X)\n", unkNum, unkNum);
-
-			size_t numberOfCommands = 0;
-			size_t numberOfStoredVerts = 0;
-			uint32_t maxTexCoordIndex = 0;
-			uint32_t maxColorCoordIndex = 0;
-			for (size_t commandListEntryIndex = 0; commandList[commandListEntryIndex].command != 0xFFFFFFFF; commandListEntryIndex++)
+			SH::CommandListScan scan;
+			if (!ScanCommandList(modelHeader.offCommandList, scan))
 			{
-				numberOfCommands = commandListEntryIndex + 1;
-        const PSX::InstDrawCommand& command = commandList[commandListEntryIndex];
-
-				// Track maximum indices to determine array sizes
-				if (command.texCoordIndex > maxTexCoordIndex)
-					maxTexCoordIndex = command.texCoordIndex;
-				if (command.colorCoordIndex > maxColorCoordIndex)
-					maxColorCoordIndex = command.colorCoordIndex;
-
-				if (command.readNextVertFromStackIndexFlag == 0) { numberOfStoredVerts++; }
+				Log("    [!] SKIPPING: %s\n", scan.rejectReason);
+				isSupportedByCurrentTechnology = false;
+				break;
 			}
 
+			const uint8_t* commandListPtr = Deref(modelHeader.offCommandList);
+			const uint32_t unkNum = scan.colorCount;
+			const PSX::InstDrawCommand* commandList = reinterpret_cast<const PSX::InstDrawCommand*>(commandListPtr + 4);
+
+			const size_t numberOfCommands = scan.numCommands;
+			const size_t numberOfStoredVerts = scan.numVerts;
+			const uint32_t maxTexCoordIndex = scan.maxTexCoordIndex;
+			const uint32_t maxColorCoordIndex = scan.maxColorCoordIndex;
+
+			RecordExtent(modelHeader.offCommandList, scan.byteSize,
+			             std::string("LOD ") + std::to_string(modelHeaderIndex) + " command list");
+
+			Log("    Command list unkNum: %u (0x%08X)\n", unkNum, unkNum);
 			Log("    Commands: %zu (0x%zx bytes)\n", numberOfCommands, (numberOfCommands + 1) * sizeof(PSX::InstDrawCommand));
 			Log("    Vertices: %zu (%zu bytes)\n", numberOfStoredVerts, numberOfStoredVerts * 3);
 			Log("    Max texture index: %u\n", maxTexCoordIndex);
@@ -479,11 +757,55 @@ void LevDataExtractor::ExtractModels(void)
 			Log("    " nameof(commandListOffset) " = 0x%zx (%zu commands, size = 0x%zx)\n",
 			       commandListOffset, numberOfCommands, commandListSize);
 
-			if (modelHeader.offFrameData != (uint32_t)nullptr)
-			{ //not animated
+			// Vertex payload length, shared by the static and animated paths. Compression is
+			// signalled by a delta array (offStaticDeltaArray here, ModelAnim::offDeltaArray
+			// when animated) -- it is orthogonal to whether the model is animated.
+			size_t vertexPayloadSize = 0; // exact bytes of encoded vertex data
+			size_t vertexSafeReadSize = 0; // bytes the game may actually dereference
+			if (!isAnimated && modelHeader.offStaticDeltaArray != 0)
+			{
+				if (!ComputeCompressedPayload(modelHeader.offStaticDeltaArray, numberOfStoredVerts,
+				                              vertexPayloadSize, vertexSafeReadSize))
+				{
+					Log("    [!] SKIPPING: static delta array out of bounds (offset 0x%08X, %zu verts)\n",
+					       modelHeader.offStaticDeltaArray, numberOfStoredVerts);
+					isSupportedByCurrentTechnology = false;
+					break;
+				}
+				Log("    Compressed vertices: payload = %zu bytes (safe read = %zu)\n",
+				       vertexPayloadSize, vertexSafeReadSize);
+			}
+			else if (!isAnimated)
+			{
+				vertexPayloadSize = numberOfStoredVerts * 3;
+				vertexSafeReadSize = vertexPayloadSize;
+			}
+
+			if (!isAnimated)
+			{
+				if (!InLevBounds(modelHeader.offFrameData, sizeof(PSX::ModelFrame)))
+				{
+					Log("    [!] SKIPPING: frame data out of bounds (offset 0x%08X)\n", modelHeader.offFrameData);
+					isSupportedByCurrentTechnology = false;
+					break;
+				}
+
 				const PSX::ModelFrame& modelFrame = *reinterpret_cast<const PSX::ModelFrame*>(Deref(modelHeader.offFrameData));
-				const uint8_t* frameDataBase = reinterpret_cast<const uint8_t*>(&modelFrame);
-				const uint8_t* vertData = (uint8_t*)(((uint64_t)&modelFrame) + modelFrame.vertexOffset);
+
+				if (!InLevBounds(modelHeader.offFrameData + modelFrame.vertexOffset, vertexSafeReadSize))
+				{
+					Log("    [!] SKIPPING: frame vertex payload out of bounds (offset 0x%08X + 0x%X, %zu bytes)\n",
+					       modelHeader.offFrameData, modelFrame.vertexOffset, vertexSafeReadSize);
+					isSupportedByCurrentTechnology = false;
+					break;
+				}
+
+				const uint8_t* vertData = reinterpret_cast<const uint8_t*>(&modelFrame) + modelFrame.vertexOffset;
+
+				RecordExtent(modelHeader.offFrameData, modelFrame.vertexOffset + vertexPayloadSize,
+				             std::string("LOD ") + std::to_string(modelHeaderIndex) + " frame data");
+				RecordExtent(modelHeader.offStaticDeltaArray, numberOfStoredVerts * sizeof(uint32_t),
+				             std::string("LOD ") + std::to_string(modelHeaderIndex) + " static delta array");
 
 				// Extract frame data: ModelFrame + mystery padding + vertices
 				frameDataOffset = currentOffset;
@@ -510,7 +832,7 @@ void LevDataExtractor::ExtractModels(void)
 
 
 				// Vertex data
-				const size_t vertexDataSize = numberOfStoredVerts * 3;
+				const size_t vertexDataSize = vertexPayloadSize;
 				uint8_t* output_VertexData = reinterpret_cast<uint8_t*>(malloc(vertexDataSize));
 				memcpy(output_VertexData, vertData, vertexDataSize);
 				currentOffset += vertexDataSize;
@@ -525,14 +847,19 @@ void LevDataExtractor::ExtractModels(void)
 					modelDataChunks.push_back({ paddingSize, padding });
 					Log("    Added %zu bytes of padding after vertices\n", paddingSize);
 				}
-			}
-			else
-			{
-				//technechally this is caught by the "pre-check" at the start of the for loop, but later on this "else" case 
-				//will probably be for supporting animated models.
-				Log("    Model has unsupported features, skipping extraction...\n");
-				isSupportedByCurrentTechnology = false;
-				break;
+
+				// Compressed static models keep their delta array alongside the frame.
+				if (modelHeader.offStaticDeltaArray != 0)
+				{
+					const size_t deltaArraySize = numberOfStoredVerts * sizeof(uint32_t);
+					staticDeltaArrayOffset = currentOffset;
+					uint8_t* output_DeltaArray = reinterpret_cast<uint8_t*>(malloc(deltaArraySize));
+					memcpy(output_DeltaArray, Deref(modelHeader.offStaticDeltaArray), deltaArraySize);
+					currentOffset += deltaArraySize;
+					modelDataChunks.push_back({ deltaArraySize, output_DeltaArray });
+					Log("    " nameof(staticDeltaArrayOffset) " = 0x%zx (size = 0x%zx)\n",
+					       staticDeltaArrayOffset, deltaArraySize);
+				}
 			}
 
 			// offTexLayout points to an array of POINTERS to TextureLayouts
@@ -546,6 +873,16 @@ void LevDataExtractor::ExtractModels(void)
 			// Texture array size = max texture index (since indices are 1-based, index N means we need N textures)
 			const size_t numTexLayouts = maxTexCoordIndex;
 
+			if (!InLevBounds(modelHeader.offTexLayout, numTexLayouts * sizeof(uint32_t)))
+			{
+				Log("    [!] SKIPPING: texture layout pointer array out of bounds (offset 0x%08X, %zu entries)\n",
+				       modelHeader.offTexLayout, numTexLayouts);
+				isSupportedByCurrentTechnology = false;
+				break;
+			}
+			RecordExtent(modelHeader.offTexLayout, numTexLayouts * sizeof(uint32_t),
+			             std::string("LOD ") + std::to_string(modelHeaderIndex) + " texLayout ptr array");
+
 			// First, write the TextureLayout structures themselves
 			const size_t textureLayoutsOffset = currentOffset;
 			const size_t texLayoutsSize = numTexLayouts * sizeof(PSX::TextureLayout);
@@ -558,9 +895,18 @@ void LevDataExtractor::ExtractModels(void)
 				// Copy textures (indices are 1-based, so texture N is at array position N-1)
 				for (size_t i = 0; i < numTexLayouts; i++)
 				{
-					const PSX::TextureLayout* layout = reinterpret_cast<const PSX::TextureLayout*>(Deref(textureLayoutPtrArray[i]));
+					const uint32_t offLayout = ReadU32(reinterpret_cast<const uint8_t*>(&textureLayoutPtrArray[i]));
+					if (!InLevBounds(offLayout, sizeof(PSX::TextureLayout)))
+					{
+						Log("    [!] SKIPPING: TextureLayout %zu out of bounds (offset 0x%08X)\n", i, offLayout);
+						isSupportedByCurrentTechnology = false;
+						break;
+					}
+					RecordExtent(offLayout, sizeof(PSX::TextureLayout), "TextureLayout");
+					const PSX::TextureLayout* layout = reinterpret_cast<const PSX::TextureLayout*>(Deref(offLayout));
 					output_TextureLayouts[i] = *layout;
 				}
+				if (!isSupportedByCurrentTechnology) { break; }
 				currentOffset += texLayoutsSize;
 				modelDataChunks.push_back({ texLayoutsSize, output_TextureLayouts });
 
@@ -680,13 +1026,29 @@ void LevDataExtractor::ExtractModels(void)
 				modelDataChunks.push_back({ ptrArraySize, output_TextureLayoutPtrArray });
 			}
 
-			// Extract colors (4-byte values, following CTR-tools)
-			// Color array size = max color index + 1 (since indices are 0-based)
+			// Extract colors (4-byte values, following CTR-tools).
+			// The game copies exactly commandList[0] colors into its scratchpad cache
+			// (RenderBucket_CopyScratchColorCache), so unkNum is authoritative. Keep the
+			// max-index bound too in case a command reaches past what unkNum claims.
 			clutOffset = currentOffset;
-			const size_t numColors = maxColorCoordIndex + 1;
+			const size_t numColors = std::max<size_t>(unkNum, maxColorCoordIndex + 1);
+			if (unkNum < maxColorCoordIndex + 1)
+			{
+				Log("    WARNING: command list declares %u colors but commands index up to %u\n",
+				       unkNum, maxColorCoordIndex);
+			}
 			const size_t colorSize = numColors * sizeof(uint32_t);
 			Log("    " nameof(clutOffset) " = 0x%zx (count = %zu, size = 0x%zx)\n",
 			       clutOffset, numColors, colorSize);
+			if (!InLevBounds(modelHeader.offColors, colorSize))
+			{
+				Log("    [!] SKIPPING: color array out of bounds (offset 0x%08X, %zu colors)\n",
+				       modelHeader.offColors, numColors);
+				isSupportedByCurrentTechnology = false;
+				break;
+			}
+			RecordExtent(modelHeader.offColors, colorSize,
+			             std::string("LOD ") + std::to_string(modelHeaderIndex) + " colors");
 			if (numColors > 0)
 			{
 				uint32_t* output_Colors = reinterpret_cast<uint32_t*>(malloc(colorSize));
@@ -699,18 +1061,163 @@ void LevDataExtractor::ExtractModels(void)
 				modelDataChunks.push_back({ colorSize, output_Colors });
 			}
 
+			// Animation data. Emitted after colors because Level::ImportModel counts the
+			// TextureLayout pointer array by scanning until it finds a word outside the model
+			// data range -- keeping colors immediately after that array preserves the walk.
+			std::vector<size_t> animBlockOffsets;
+			if (isAnimated)
+			{
+				if (!InLevBounds(modelHeader.offAnimations, modelHeader.numAnimations * sizeof(uint32_t)))
+				{
+					Log("    [!] SKIPPING: animation pointer array out of bounds (offset 0x%08X, %u entries)\n",
+					       modelHeader.offAnimations, modelHeader.numAnimations);
+					isSupportedByCurrentTechnology = false;
+					break;
+				}
+
+				const uint8_t* animPtrArray = Deref(modelHeader.offAnimations);
+				RecordExtent(modelHeader.offAnimations, modelHeader.numAnimations * sizeof(uint32_t),
+				             std::string("LOD ") + std::to_string(modelHeaderIndex) + " anim ptr array");
+
+				// Validate every animation before emitting anything.
+				std::vector<SH::AnimExtent> extents(modelHeader.numAnimations);
+				bool allAnimsValid = true;
+				for (uint32_t animIndex = 0; animIndex < modelHeader.numAnimations; animIndex++)
+				{
+					const uint32_t offAnim = ReadU32(animPtrArray + animIndex * sizeof(uint32_t));
+					if (offAnim == 0)
+					{
+						// RenderBucket_GetAnim indexes this array directly, so there is no
+						// terminator and a null entry would be dereferenced.
+						Log("    [!] SKIPPING: animation %u has a null pointer\n", animIndex);
+						allAnimsValid = false;
+						break;
+					}
+
+					if (!ValidateAnim(offAnim, numberOfStoredVerts, extents[animIndex]))
+					{
+						Log("    [!] SKIPPING: animation %u invalid: %s\n",
+						       animIndex, extents[animIndex].rejectReason.c_str());
+						allAnimsValid = false;
+						break;
+					}
+
+					const SH::AnimExtent& extent = extents[animIndex];
+					RecordExtent(extent.offAnim, extent.animBlockBytes,
+					             std::string("LOD ") + std::to_string(modelHeaderIndex)
+					             + " anim " + std::to_string(animIndex) + " block");
+					RecordExtent(extent.offDeltaArray, extent.deltaArrayBytes, "anim delta array");
+
+					const PSX::ModelAnim& anim = *reinterpret_cast<const PSX::ModelAnim*>(Deref(offAnim));
+					Log("    Anim %u: %s -- %zu stored frames (raw 0x%04X%s), frameSize 0x%zx, vertexOffset 0x%zx, %s\n",
+					       animIndex, anim.name, extent.numStoredFrames, anim.numFrames,
+					       (anim.numFrames & PSX::ANIM_INTERPOLATED_BIT) ? ", interpolated" : "",
+					       extent.frameSize, extent.vertexOffset,
+					       extent.offDeltaArray ? "compressed" : "uncompressed");
+
+					// frameSize is independent ground truth. Matching it proves the vertex
+					// count and (when compressed) the bit-width math simultaneously.
+					// Verified against all 107 vanilla LEVs: 332/332 animations match.
+					const size_t expectedFrameSize = Align4(extent.vertexOffset + extent.payloadBytes);
+					if (expectedFrameSize != extent.frameSize)
+					{
+						Log("      WARNING: frameSize 0x%zx != expected 0x%zx (0x%zx + %zu payload bytes, aligned)\n",
+						       extent.frameSize, expectedFrameSize, extent.vertexOffset, extent.payloadBytes);
+					}
+				}
+
+				if (!allAnimsValid)
+				{
+					isSupportedByCurrentTechnology = false;
+					break;
+				}
+
+				// Delta arrays first. Several animations commonly share one, so emit each
+				// unique source offset once and let them all point at it.
+				std::unordered_map<uint32_t, size_t> deltaArraySrcToDst;
+				for (const SH::AnimExtent& extent : extents)
+				{
+					if (extent.offDeltaArray == 0) { continue; }
+					if (deltaArraySrcToDst.count(extent.offDeltaArray)) { continue; }
+
+					const size_t deltaArrayOffset = currentOffset;
+					uint8_t* output_DeltaArray = reinterpret_cast<uint8_t*>(malloc(extent.deltaArrayBytes));
+					memcpy(output_DeltaArray, Deref(extent.offDeltaArray), extent.deltaArrayBytes);
+					currentOffset += extent.deltaArrayBytes;
+					modelDataChunks.push_back({ extent.deltaArrayBytes, output_DeltaArray });
+					deltaArraySrcToDst[extent.offDeltaArray] = deltaArrayOffset;
+					Log("    Delta array (src 0x%08X) = 0x%zx (size = 0x%zx)\n",
+					       extent.offDeltaArray, deltaArrayOffset, extent.deltaArrayBytes);
+				}
+
+				// ModelAnim blocks, copied verbatim (header + all frames + any padding).
+				animBlockOffsets.resize(modelHeader.numAnimations);
+				for (uint32_t animIndex = 0; animIndex < modelHeader.numAnimations; animIndex++)
+				{
+					const SH::AnimExtent& extent = extents[animIndex];
+
+					animBlockOffsets[animIndex] = currentOffset;
+					uint8_t* output_Anim = reinterpret_cast<uint8_t*>(malloc(extent.animBlockBytes));
+					memcpy(output_Anim, Deref(extent.offAnim), extent.animBlockBytes);
+
+					// Repoint the copy's delta array into the output file.
+					PSX::ModelAnim* output_AnimHeader = reinterpret_cast<PSX::ModelAnim*>(output_Anim);
+					output_AnimHeader->offDeltaArray = extent.offDeltaArray
+					    ? static_cast<uint32_t>(deltaArraySrcToDst[extent.offDeltaArray])
+					    : 0;
+
+					currentOffset += extent.animBlockBytes;
+					modelDataChunks.push_back({ extent.animBlockBytes, output_Anim });
+					Log("    Anim %u block = 0x%zx (size = 0x%zx)\n",
+					       animIndex, animBlockOffsets[animIndex], extent.animBlockBytes);
+
+					if (extent.offDeltaArray != 0)
+					{
+						patchTable.push_back(CALCULATE_OFFSET(PSX::ModelAnim, offDeltaArray, animBlockOffsets[animIndex]));
+					}
+				}
+
+				// Pointer array that offAnimations points at.
+				const size_t animPtrArraySize = modelHeader.numAnimations * sizeof(uint32_t);
+				animPtrArrayOffset = currentOffset;
+				uint32_t* output_AnimPtrArray = reinterpret_cast<uint32_t*>(malloc(animPtrArraySize));
+				for (uint32_t animIndex = 0; animIndex < modelHeader.numAnimations; animIndex++)
+				{
+					output_AnimPtrArray[animIndex] = static_cast<uint32_t>(animBlockOffsets[animIndex]);
+					patchTable.push_back(static_cast<uint32_t>(animPtrArrayOffset + animIndex * sizeof(uint32_t)));
+				}
+				currentOffset += animPtrArraySize;
+				modelDataChunks.push_back({ animPtrArraySize, output_AnimPtrArray });
+				Log("    " nameof(animPtrArrayOffset) " = 0x%zx (%u entries)\n",
+				       animPtrArrayOffset, modelHeader.numAnimations);
+			}
+
 			// Patch ModelHeader offsets
 			output_ModelHeader->offCommandList = unkNumOffset;  // Points to unkNum (start of command list structure)
-			output_ModelHeader->offFrameData = frameDataOffset;
+			output_ModelHeader->offFrameData = frameDataOffset; // 0 when animated
 			output_ModelHeader->offTexLayout = (numTexLayouts > 0) ? texLayoutOffset : 0;
 			output_ModelHeader->offColors = (numColors > 0) ? clutOffset : 0;
+			output_ModelHeader->offStaticDeltaArray = staticDeltaArrayOffset;
+			output_ModelHeader->offAnimations = animPtrArrayOffset;
 
-			// Add ModelHeader pointer fields to patch table
+			// Add ModelHeader pointer fields to patch table.
+			// Only non-zero fields: SaveLEV rebases every entry unconditionally
+			// (levPointerValue = modelBaseOffset + (ctrPointerValue - modelOffset)), so a
+			// zero would become a non-null garbage pointer. offFrameData is legitimately
+			// zero for animated models.
 			size_t headerBaseOffset = allHeadersOffset + (modelHeaderIndex * sizeof(PSX::ModelHeader));
-			patchTable.push_back(CALCULATE_OFFSET(PSX::ModelHeader, offCommandList, headerBaseOffset));
-			patchTable.push_back(CALCULATE_OFFSET(PSX::ModelHeader, offFrameData, headerBaseOffset));
-			patchTable.push_back(CALCULATE_OFFSET(PSX::ModelHeader, offTexLayout, headerBaseOffset));
-			patchTable.push_back(CALCULATE_OFFSET(PSX::ModelHeader, offColors, headerBaseOffset));
+			if (output_ModelHeader->offCommandList != 0)
+				patchTable.push_back(CALCULATE_OFFSET(PSX::ModelHeader, offCommandList, headerBaseOffset));
+			if (output_ModelHeader->offFrameData != 0)
+				patchTable.push_back(CALCULATE_OFFSET(PSX::ModelHeader, offFrameData, headerBaseOffset));
+			if (output_ModelHeader->offTexLayout != 0)
+				patchTable.push_back(CALCULATE_OFFSET(PSX::ModelHeader, offTexLayout, headerBaseOffset));
+			if (output_ModelHeader->offColors != 0)
+				patchTable.push_back(CALCULATE_OFFSET(PSX::ModelHeader, offColors, headerBaseOffset));
+			if (output_ModelHeader->offStaticDeltaArray != 0)
+				patchTable.push_back(CALCULATE_OFFSET(PSX::ModelHeader, offStaticDeltaArray, headerBaseOffset));
+			if (output_ModelHeader->offAnimations != 0)
+				patchTable.push_back(CALCULATE_OFFSET(PSX::ModelHeader, offAnimations, headerBaseOffset));
 
       //modelHeader.name --- done
       //modelHeader.unk1 --- NOT DONE: could be a pointer, if just a value then should be done
@@ -718,18 +1225,26 @@ void LevDataExtractor::ExtractModels(void)
 			//modelHeader.flags --- done
       //modelHeader.scale --- done
 			//modelHeader.maybeScaleMaybePadding --- done
-			//modelHeader.offCommandList --- NOT DONE: is a pointer, need to capture this data, is terminated by 0xFFFFFFFF
-      //modelHeader.offFrameData --- NOT DONE: is a pointer, need to capture this data, is a ModelFrame followed by variable length data, need to dry-parse command list to know how long this is.
-			//modelHeader.offTexLayout --- NOT DONE: is a pointer to an array of pointers (it isn't clear how long this array is, may need to dry-parse command list to know how long this is).
-			//modelHeader.offColors --- NOT DONE: is a pointer to the same location as offTexLayout??????? This however DOESN'T point to the same location for the startbanner model, needs investigation.
-      //modelHeader.unk3 --- NOT DONE: could be a pointer, if just a value then should be done
+			//modelHeader.offCommandList --- done
+      //modelHeader.offFrameData --- done
+			//modelHeader.offTexLayout --- done
+			//modelHeader.offColors --- done: sized by the command list's leading color count (unkNum)
+      //modelHeader.offStaticDeltaArray (was unk3) --- done: compressed-vertex bit-width table, numVerts * u32
       //modelHeader.numAnimations --- done
-      //modelHeader.offAnimations --- NOT DONE: is a pointer,
-      //modelHeader.offAnimtex --- NOT DONE: is a pointer,
+      //modelHeader.offAnimations --- done
+      //modelHeader.offAnimtex --- NOT DONE: is a pointer, still rejected
 
 
 			//TODO: fix bug where a single quadblock breaks the CTE
 			//TODO: fix bug where spam clicking around causes turbo pads suddenly delete themselves
+		}
+
+		// Self-check the byte ranges we claimed from the LEV before committing them to the
+		// output file. A partial overlap means some computed size is too large.
+		if (isSupportedByCurrentTechnology && !ValidateExtents(levExtents, model.name))
+		{
+			Log("  Model has overlapping source extents, skipping extraction...\n");
+			isSupportedByCurrentTechnology = false;
 		}
 
 		output_Model->offHeaders = allHeadersOffset;

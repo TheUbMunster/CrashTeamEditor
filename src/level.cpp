@@ -2214,20 +2214,54 @@ bool Level::SaveLEV(const std::filesystem::path& path, bool useRawTextures)
 	printf(nameof(offOxideGhost) " = %zx\n", offOxideGhost);
 	currOffset += m_oxideGhost.size();
 
+	// GOTCHA: a level with no SPAWN data silently freezes every hazard.
+	//
+	// Symptom: an armadillo (or plant/orca/flamejet) renders correctly, its birth
+	// handler runs, its thread is created and ticks every frame -- and it never moves.
+	//
+	// Cause: hazard birth handlers seed their per-instance timer from this array,
+	// indexed by the last digit of the instance name, with no null check:
+	//   timeAtEdge = metaArray[inst->name[strlen(inst->name) - 1] - '0'];
+	// but that line only runs when count > 0. Retail does NOT zero timeAtEdge
+	// beforehand (the saphi-ctr-native decomp shows an initializer that retail lacks
+	// -- do not trust it here), so when count == 0 the field keeps whatever garbage
+	// the thread's pool block last held. The tick then does
+	//   if (timeAtEdge != 0) { timeAtEdge--; return; }
+	// and returns early forever. Observed: timeAtEdge == 0x933C, decrementing once a
+	// frame, i.e. ~21 minutes of paralysis.
+	//
+	// Vanilla never hits this: all 79 levels that can contain a hazard have a valid
+	// SPAWN entry and count 4 or 6. The only vanilla levels with count == 0 are the
+	// 28 battle arenas, which contain no hazards and so never reach the code.
+	//
+	// So always emit the array. Zero-filled means "no stagger delay", which is what a
+	// lone hazard wants; non-zero values stagger multiple hazards onto separate cycles.
+	constexpr size_t SPAWN_META_ENTRY_COUNT = 20; // covers plant's metaArray[digit * 2 + 1] for digits 0-9
+	const std::vector<int16_t> spawnMeta(SPAWN_META_ENTRY_COUNT, 0);
+	const size_t offSpawnMeta = currOffset;
+	printf(nameof(offSpawnMeta) " = %zx\n", offSpawnMeta);
+	currOffset += spawnMeta.size() * sizeof(int16_t);
+
 	PSX::LevelExtraHeader extraHeader = {};
-	if (offTropyGhost > 0)
-	{
-		if (offOxideGhost > 0) { extraHeader.count = PSX::LevelExtra::COUNT; }
-		else { extraHeader.count = PSX::LevelExtra::N_OXIDE_GHOST; }
-	}
-	else { extraHeader.count = 0; }
 	extraHeader.offsets[PSX::LevelExtra::MINIMAP] = 0;
-	extraHeader.offsets[PSX::LevelExtra::SPAWN] = 0;
+	extraHeader.offsets[PSX::LevelExtra::SPAWN] = static_cast<uint32_t>(offSpawnMeta);
 	extraHeader.offsets[PSX::LevelExtra::CAMERA_END_OF_RACE] = 0;
 	extraHeader.offsets[PSX::LevelExtra::CAMERA_DEMO] = 0;
 	extraHeader.offsets[PSX::LevelExtra::N_TROPY_GHOST] = static_cast<uint32_t>(offTropyGhost);
 	extraHeader.offsets[PSX::LevelExtra::N_OXIDE_GHOST] = static_cast<uint32_t>(offOxideGhost);
 	extraHeader.offsets[PSX::LevelExtra::CREDITS] = 0;
+
+	// count = number of valid entries in offsets[]. SPAWN is index 1 and is always
+	// written now, so the floor is CAMERA_DEMO + 1 (== 4) -- the value 61 of the 79
+	// hazard-capable vanilla levels use, and enough that hazard handlers pass their
+	// `count > 0` gate. Camera code requires count >= 3 but null-checks the pointer
+	// it then reads, so leaving CAMERA_* at 0 is safe.
+	if (offTropyGhost > 0)
+	{
+		if (offOxideGhost > 0) { extraHeader.count = PSX::LevelExtra::COUNT; }
+		else { extraHeader.count = PSX::LevelExtra::N_OXIDE_GHOST; }
+	}
+	else { extraHeader.count = PSX::LevelExtra::CAMERA_DEMO + 1; }
 
 	const size_t offExtraHeader = currOffset;
 	printf(nameof(offExtraHeader) " = %zx\n", offExtraHeader);
@@ -2534,8 +2568,14 @@ bool Level::SaveLEV(const std::filesystem::path& path, bool useRawTextures)
 		}
 	}
 
-	if (offTropyGhost != 0) { pointerMap.push_back(CALCULATE_OFFSET(PSX::LevelExtraHeader, offsets[PSX::LevelExtra::N_TROPY_GHOST], offExtraHeader)); }
-	if (offOxideGhost != 0) { pointerMap.push_back(CALCULATE_OFFSET(PSX::LevelExtraHeader, offsets[PSX::LevelExtra::N_OXIDE_GHOST], offExtraHeader)); }
+	// Every non-zero entry in the extra header is a pointer and must be relocated.
+	// Previously only the two ghost entries were registered, so any other offset the
+	// editor started writing would reach the game as a raw file offset.
+	for (size_t i = 0; i < PSX::LevelExtra::COUNT; i++)
+	{
+		if (extraHeader.offsets[i] == 0) { continue; }
+		pointerMap.push_back(static_cast<uint32_t>(offExtraHeader + offsetof(PSX::LevelExtraHeader, offsets) + (i * sizeof(uint32_t))));
+	}
 
 	for (size_t i = 0; i < animPtrMapOffsets.size(); i++)
 	{
@@ -2616,6 +2656,7 @@ bool Level::SaveLEV(const std::filesystem::path& path, bool useRawTextures)
 	for (const std::vector<uint8_t>& serializedCheckpoint : serializedCheckpoints) { Write(file, serializedCheckpoint.data(), serializedCheckpoint.size()); }
 	if (!m_tropyGhost.empty()) { Write(file, m_tropyGhost.data(), m_tropyGhost.size()); }
 	if (!m_oxideGhost.empty()) { Write(file, m_oxideGhost.data(), m_oxideGhost.size()); }
+	Write(file, spawnMeta.data(), spawnMeta.size() * sizeof(int16_t));
 	Write(file, &extraHeader, sizeof(extraHeader));
 	Write(file, &navTable, sizeof(navTable));
 	for (const std::vector<uint8_t>& serializedBotPath : serializedBotPaths) { Write(file, serializedBotPath.data(), serializedBotPath.size()); }

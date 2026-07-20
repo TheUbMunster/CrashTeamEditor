@@ -7,6 +7,45 @@
 
 #include "psx_types.h"
 
+namespace SH
+{
+	// Result of dry-parsing a model's command list.
+	struct CommandListScan
+	{
+		bool valid = false;
+		size_t numCommands = 0;        // excluding the 0xFFFFFFFF terminator
+		size_t numVerts = 0;           // == the renderer's final ctx->vertexIndex
+		uint32_t colorCount = 0;       // word 0 -- authoritative color-array length
+		uint32_t maxTexCoordIndex = 0; // from non-color-only commands only
+		uint32_t maxColorCoordIndex = 0;
+		size_t byteSize = 0;           // 4 + (numCommands + 1) * 4
+		const char* rejectReason = nullptr;
+	};
+
+	// Validated byte extents of one ModelAnim and its vertex data.
+	struct AnimExtent
+	{
+		uint32_t offAnim = 0;
+		uint32_t offDeltaArray = 0; // 0 if uncompressed
+		size_t numStoredFrames = 0;
+		size_t frameSize = 0;
+		size_t animBlockBytes = 0;  // 0x18 + numStoredFrames * frameSize
+		size_t deltaArrayBytes = 0; // numVerts * 4, or 0
+		size_t payloadBytes = 0;    // cross-check only; sizing uses frameSize
+		size_t vertexOffset = 0;    // uniform across this animation's frames; usually 0x1C
+		std::string rejectReason;
+	};
+
+	// A byte range claimed from the source LEV, used to self-check that no two blocks
+	// overlap (which would mean a computed size is too large).
+	struct LevExtent
+	{
+		uint32_t start = 0;
+		uint32_t end = 0;
+		std::string label;
+	};
+}
+
 class LevDataExtractor
 {
 public:
@@ -29,6 +68,26 @@ private:
 
 	// VRAM operations
 	void ParseVrmIntoVram(VramBuffer& vram);
+
+	// Bounds-checked access to LEV data. Offsets are from start of file + 4 (see Deref).
+	bool InLevBounds(uint32_t offset, size_t size) const;
+
+	// Dry-parses a command list, mirroring RenderBucket_DrawFunc_Normal. Returns false
+	// (and fills out.rejectReason) if the list is out of bounds or unterminated.
+	bool ScanCommandList(uint32_t offCommandList, SH::CommandListScan& out);
+
+	// Exact byte length of a compressed vertex payload, derived purely from the delta
+	// array's per-vertex bit widths. outSafeReadBytes is the (larger) extent the game
+	// may actually dereference.
+	bool ComputeCompressedPayload(uint32_t offDeltaArray, size_t numVerts,
+	                              size_t& outPayloadBytes, size_t& outSafeReadBytes);
+
+	// Validates one ModelAnim and computes its byte extents. numVerts comes from the
+	// owning ModelHeader's command list scan.
+	bool ValidateAnim(uint32_t offAnim, size_t numVerts, SH::AnimExtent& out);
+
+	// Self-check: no two blocks claimed from the LEV may partially overlap.
+	bool ValidateExtents(std::vector<SH::LevExtent>& extents, const char* modelName);
 
 	std::filesystem::path m_levPath;
 	std::filesystem::path m_vrmPath;
